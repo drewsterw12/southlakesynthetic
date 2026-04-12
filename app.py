@@ -164,6 +164,80 @@ st.markdown(f"""
 
 
 # ============================================================
+# TRIVIAL CORRELATION PAIRS TO EXCLUDE  # CHANGED
+# ============================================================
+TRIVIAL_PAIRS = {
+    frozenset({'has_stairs', 'num_staircases'}),
+    frozenset({'has_stairs', 'num_storeys'}),
+    frozenset({'num_staircases', 'num_storeys'}),
+    frozenset({'chronic_condition_count', 'has_diabetes'}),
+    frozenset({'chronic_condition_count', 'has_hypertension'}),
+    frozenset({'chronic_condition_count', 'has_copd'}),
+    frozenset({'chronic_condition_count', 'has_asthma'}),
+    frozenset({'chronic_condition_count', 'has_heart_disease'}),
+    frozenset({'chronic_condition_count', 'has_mood_disorder'}),
+    frozenset({'chronic_condition_count', 'has_arthritis'}),
+    frozenset({'chronic_condition_count', 'risk_score'}),
+    frozenset({'chronic_condition_count', 'er_visits_12mo'}),
+    frozenset({'risk_score', 'er_visits_12mo'}),
+    frozenset({'fall_risk_score', 'had_fall_12mo'}),
+    frozenset({'fall_risk_score', 'has_mobility_limitation'}),
+    frozenset({'has_mobility_limitation', 'had_fall_12mo'}),
+}
+
+
+def is_trivial_pair(var1, var2):  # CHANGED
+    """Check if a correlation pair is trivially obvious / definitionally linked."""
+    return frozenset({var1, var2}) in TRIVIAL_PAIRS
+
+
+def classify_correlation_strength(r):  # CHANGED
+    """Healthcare-appropriate correlation thresholds."""
+    abs_r = abs(r)
+    if abs_r >= 0.7:
+        return '🔴 Strong'
+    elif abs_r >= 0.4:
+        return '🟡 Moderate'
+    else:
+        return '⚪ Weak'
+
+
+def get_relevant_variables(question, all_columns):  # CHANGED
+    """Use LLM to identify which variables are relevant to the user's question.
+    Falls back to all columns if LLM is unavailable."""
+    try:
+        from langchain_openai import ChatOpenAI
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+        if not api_key:
+            return all_columns
+
+        llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key)
+        resp = llm.invoke([
+            SystemMessage(content="""You are a healthcare data analyst. Given a user's question 
+and a list of dataset columns, return ONLY a JSON array of column names that are 
+clinically relevant to answering the question. 
+
+Rules:
+- Include variables that are direct risk factors, outcomes, or demographics relevant to the question
+- Include geographic/segmentation variables if the question asks about populations or municipalities
+- EXCLUDE variables that are obviously unrelated (e.g., housing variables for a diabetes question, 
+  unless the question specifically asks about social determinants of health)
+- When in doubt, include the variable
+- Return ONLY valid JSON, no explanation"""),
+            HumanMessage(content=f"QUESTION: {question}\n\nAVAILABLE COLUMNS: {json.dumps(all_columns)}")
+        ])
+        relevant = json.loads(resp.content)
+        # Ensure we always have at least some columns
+        if len(relevant) < 3:
+            return all_columns
+        return [c for c in relevant if c in all_columns]
+    except:
+        return all_columns
+
+
+# ============================================================
 # BACKEND CLASSES
 # ============================================================
 
@@ -685,6 +759,8 @@ if 'narrative' not in st.session_state:
     st.session_state.narrative = None
 if 'question' not in st.session_state:
     st.session_state.question = ""
+if 'relevant_vars' not in st.session_state:  # CHANGED
+    st.session_state.relevant_vars = None
 
 
 # ============================================================
@@ -702,6 +778,12 @@ def run_pipeline(question, n_synth=10000):
     csv_path = os.path.join(DATA_DIR, "source_data.csv")
     df.to_csv(csv_path, index=False)
     st.session_state.original_df = df
+    progress.progress(10, text="Identifying relevant variables...")  # CHANGED
+
+    # CHANGED — Phase 2b: Identify relevant variables based on question
+    all_columns = list(df.columns)
+    relevant_vars = get_relevant_variables(question, all_columns)
+    st.session_state.relevant_vars = relevant_vars
     progress.progress(15, text="Generating SAS profiling code...")
 
     # Phase 3: SAS profiling
@@ -763,19 +845,33 @@ run;
     st.session_state.sas_programs['05_fidelity'] = fid_import + fid_code
     progress.progress(85, text="Generating clinical narrative...")
 
-    # Phase 9: Narrative
+    # Phase 9: Narrative  # CHANGED — now uses relevant_vars for focused analysis
     try:
         from langchain_openai import ChatOpenAI
         from langchain_core.messages import HumanMessage, SystemMessage
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.1,
-                         api_key=os.getenv("OPENAI_API_KEY"))
+
+        api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))  # CHANGED
+        llm = ChatOpenAI(model="gpt-4o", temperature=0.1, api_key=api_key)
+
         cat_cols = [c for c in cleaned.columns if not pd.api.types.is_numeric_dtype(cleaned[c])]
-        corr_matrix = cleaned[numeric_cols].corr(method='spearman')
+
+        # CHANGED — filter correlations to relevant variables only
+        relevant_numeric = [c for c in relevant_vars
+                            if c in numeric_cols or c in [col for col in cleaned.columns
+                            if pd.api.types.is_numeric_dtype(cleaned[col])]]
+        if len(relevant_numeric) < 2:
+            relevant_numeric = numeric_cols
+
+        corr_matrix = cleaned[relevant_numeric].corr(method='spearman')
         corr_pairs = []
-        for i in range(len(numeric_cols)):
-            for j in range(i + 1, len(numeric_cols)):
-                corr_pairs.append({'var1': numeric_cols[i], 'var2': numeric_cols[j],
-                                   'correlation': round(corr_matrix.iloc[i, j], 3)})
+        for i in range(len(relevant_numeric)):
+            for j in range(i + 1, len(relevant_numeric)):
+                v1, v2 = relevant_numeric[i], relevant_numeric[j]
+                if is_trivial_pair(v1, v2):  # CHANGED — skip trivial pairs
+                    continue
+                corr_pairs.append({'var1': v1, 'var2': v2,
+                                   'correlation': round(corr_matrix.iloc[i, j], 3),
+                                   'strength': classify_correlation_strength(corr_matrix.iloc[i, j])})
         corr_pairs.sort(key=lambda x: abs(x['correlation']), reverse=True)
 
         resp = llm.invoke([
@@ -783,15 +879,24 @@ run;
 Generate a concise clinical report based on the analysis results.
 Use markdown headers and bullet points. Include: key findings,
 correlations discovered, population insights, and how the synthetic
-data can be used. Answer the original question directly."""),
+data can be used. Answer the original question directly.
+
+IMPORTANT: Only discuss correlations that are clinically meaningful. 
+Use these healthcare-appropriate thresholds:
+- Strong: |r| >= 0.7
+- Moderate: 0.4 <= |r| < 0.7 
+- Weak: |r| < 0.4
+Do NOT mention trivially obvious relationships (e.g., stairs vs staircases, 
+chronic_condition_count vs individual conditions)."""),
             HumanMessage(content=f"""
 QUESTION: {question}
+RELEVANT VARIABLES IDENTIFIED: {relevant_vars}
 DATASET: {len(cleaned):,} records from Southlake catchment
 (Newmarket, Aurora, East Gwillimbury, Georgina, Bradford West Gwillimbury, King, Innisfil)
-KEY STATS:
-{cleaned[numeric_cols].describe().to_string()}
-TOP CORRELATIONS: {json.dumps(corr_pairs[:10], default=str)}
-VARIABLES: {list(cleaned.columns)}
+KEY STATS (relevant variables):
+{cleaned[[c for c in relevant_vars if c in cleaned.columns and pd.api.types.is_numeric_dtype(cleaned[c])]].describe().to_string()}
+TOP NON-TRIVIAL CORRELATIONS: {json.dumps(corr_pairs[:15], default=str)}
+ALL VARIABLES: {list(cleaned.columns)}
 CATEGORICAL:
 {chr(10).join(f"{c}: {cleaned[c].value_counts().head(5).to_dict()}" for c in cat_cols[:8])}
 SYNTHETIC: {len(synthetic):,} records | FIDELITY: {fidelity['overall_score']:.1f}%
@@ -918,6 +1023,14 @@ if page == "🏥 Home":
             metric_card("SAS Programs",
                         str(len(st.session_state.sas_programs)),
                         "Ready to execute")
+
+        # CHANGED — show which variables the agent identified as relevant
+        if st.session_state.relevant_vars:
+            with st.expander("🎯 Variables identified as relevant to your question"):
+                cols = st.columns(4)
+                for i, var in enumerate(st.session_state.relevant_vars):
+                    with cols[i % 4]:
+                        st.markdown(f"• `{var}`")
 
 
 # ============================================================
@@ -1081,13 +1194,13 @@ elif page == "🧹 Data Hygiene":
 
 
 # ============================================================
-# PAGE: CORRELATIONS
+# PAGE: CORRELATIONS  # CHANGED — major updates
 # ============================================================
 elif page == "🔗 Correlations":
     st.markdown("""
     <div class="phase-header">
         <h2>🔗 Correlation Analysis</h2>
-        <span>Phase 5 — Spearman rank correlations & cross-tabulations</span>
+        <span>Phase 5 — Spearman rank correlations filtered by clinical relevance</span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1096,14 +1209,36 @@ elif page == "🔗 Correlations":
     else:
         df = st.session_state.cleaned_df
         numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-        corr = df[numeric_cols].corr(method='spearman')
+        relevant_vars = st.session_state.relevant_vars or numeric_cols
+
+        # CHANGED — filter to relevant numeric columns for the focused view
+        relevant_numeric = [c for c in relevant_vars
+                            if c in numeric_cols]
+        if len(relevant_numeric) < 2:
+            relevant_numeric = numeric_cols
+
+        # CHANGED — show toggle between full and focused view
+        view_mode = st.radio(
+            "View mode",
+            ["🎯 Focused (relevant to your question)", "📋 Full (all variables)"],
+            horizontal=True
+        )
+
+        if view_mode.startswith("🎯"):
+            display_cols = relevant_numeric
+            st.caption(f"Showing correlations for {len(display_cols)} variables relevant to: *\"{st.session_state.question[:80]}...\"*")
+        else:
+            display_cols = numeric_cols
+
+        corr = df[display_cols].corr(method='spearman')
 
         st.markdown("### Spearman Correlation Matrix")
-        fig, ax = plt.subplots(figsize=(14, 10))
+        fig, ax = plt.subplots(figsize=(max(8, len(display_cols) * 0.9),
+                                         max(6, len(display_cols) * 0.7)))
         mask = np.triu(np.ones_like(corr, dtype=bool), k=1)
         sns.heatmap(corr, mask=mask, annot=True, fmt='.2f', cmap='RdBu_r',
                     center=0, vmin=-1, vmax=1, ax=ax, square=True,
-                    linewidths=0.5, annot_kws={'size': 7},
+                    linewidths=0.5, annot_kws={'size': 7 if len(display_cols) <= 12 else 5},
                     cbar_kws={'shrink': 0.8})
         ax.set_title('Spearman Rank Correlation Matrix', fontsize=14,
                      fontweight='bold', color=COLORS['navy'])
@@ -1111,20 +1246,34 @@ elif page == "🔗 Correlations":
         st.pyplot(fig)
         plt.close()
 
-        st.markdown("### Strongest Relationships")
+        # CHANGED — healthcare thresholds and trivial pair filtering
+        st.markdown("### Clinically Meaningful Relationships")
+        st.markdown(f"""
+        <div style="background:{COLORS['light_bg']}; padding:12px 16px; border-radius:8px;
+                    margin-bottom:16px; font-size:13px;">
+            <b>Healthcare correlation thresholds:</b>
+            🔴 Strong |r| ≥ 0.7   
+            🟡 Moderate 0.4 ≤ |r| < 0.7   
+            ⚪ Weak |r| < 0.4   
+            <br><i>Trivially obvious pairs (e.g., stairs ↔ staircases) are excluded.</i>
+        </div>
+        """, unsafe_allow_html=True)
+
         pairs = []
-        for i in range(len(numeric_cols)):
-            for j in range(i + 1, len(numeric_cols)):
+        for i in range(len(display_cols)):
+            for j in range(i + 1, len(display_cols)):
+                v1, v2 = display_cols[i], display_cols[j]
+                if is_trivial_pair(v1, v2):
+                    continue
+                r = corr.iloc[i, j]
                 pairs.append({
-                    'Variable 1': numeric_cols[i],
-                    'Variable 2': numeric_cols[j],
-                    'Correlation': round(corr.iloc[i, j], 4),
-                    'Strength': ('🔴 Strong' if abs(corr.iloc[i, j]) > 0.5
-                                 else '🟡 Moderate' if abs(corr.iloc[i, j]) > 0.3
-                                 else '⚪ Weak')
+                    'Variable 1': v1,
+                    'Variable 2': v2,
+                    'Correlation': round(r, 4),
+                    'Strength': classify_correlation_strength(r)
                 })
         pairs.sort(key=lambda x: abs(x['Correlation']), reverse=True)
-        st.dataframe(pd.DataFrame(pairs[:15]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(pairs[:20]), use_container_width=True, hide_index=True)
 
         with st.expander("🔍 View SAS Code — PROC CORR / PROC FREQ Chi-squared"):
             st.code(st.session_state.sas_programs.get('03_correlations', ''), language='sas')
