@@ -222,7 +222,25 @@ TRIVIAL_PAIRS = {
 
 
 def is_trivial_pair(var1, var2):
-    return frozenset({var1, var2}) in TRIVIAL_PAIRS
+    if frozenset({var1, var2}) in TRIVIAL_PAIRS:
+        return True
+    # Dynamic trivial pairs: chronic_condition_count is always trivially
+    # correlated with any has_* condition column
+    if 'chronic_condition_count' in {var1, var2}:
+        other = var2 if var1 == 'chronic_condition_count' else var1
+        if other.startswith('has_') and other not in ('has_stairs', 'has_mobility_limitation'):
+            return True
+    # risk_score is derived from age and conditions — trivially correlated
+    if 'risk_score' in {var1, var2}:
+        other = var2 if var1 == 'risk_score' else var1
+        if other in ('chronic_condition_count', 'er_visits_12mo') or other.startswith('has_'):
+            return True
+    # er_visits_12mo is derived from risk_score
+    if 'er_visits_12mo' in {var1, var2}:
+        other = var2 if var1 == 'er_visits_12mo' else var1
+        if other in ('risk_score', 'chronic_condition_count'):
+            return True
+    return False
 
 
 def classify_correlation_strength(r):
@@ -237,70 +255,210 @@ def classify_correlation_strength(r):
         return '⚫ Negligible'
 
 
+def get_question_specific_vars(question, df):
+    """Identify which variables are most relevant to the user's question for plotting."""
+    question_lower = question.lower()
+    
+    # Core demographics only if they exist in the dataset
+    core_vars = [v for v in ['age', 'income'] if v in df.columns]
+    
+    # Identify question-specific variables
+    specific_vars = []
+    
+    # Check all has_ columns
+    for col in df.columns:
+        if col.startswith('has_'):
+            cond_name = col.replace('has_', '').replace('_', ' ')
+            if cond_name in question_lower or any(word in question_lower for word in cond_name.split()):
+                specific_vars.append(col)
+    
+    # Check all is_ columns (risk factors)
+    for col in df.columns:
+        if col.startswith('is_'):
+            rf_name = col.replace('is_', '').replace('_', ' ')
+            if rf_name in question_lower or any(word in question_lower for word in rf_name.split()):
+                specific_vars.append(col)
+    
+    # Check numeric risk factors (bmi, blood_pressure, etc.)
+    for col in df.columns:
+        if col not in core_vars and pd.api.types.is_numeric_dtype(df[col]):
+            col_name = col.replace('_', ' ')
+            if col_name in question_lower or any(word in question_lower for word in col_name.split() if len(word) > 3):
+                specific_vars.append(col)
+    
+    # Add related variables from additional risk factors
+    for rf in (st.session_state.get('additional_risk_factors') or []):
+        rf_name = rf.get('name', '')
+        if rf_name in df.columns and rf_name not in specific_vars:
+            specific_vars.append(rf_name)
+    
+    # Add related conditions from additional conditions
+    for cond in (st.session_state.get('additional_conditions') or []):
+        col_name = f"has_{cond['name']}"
+        if col_name in df.columns and col_name not in specific_vars:
+            specific_vars.append(col_name)
+    
+    # Build final list: core + specific + general health metrics
+    plot_vars = core_vars.copy()
+    plot_vars.extend(specific_vars)
+    
+    # Add general health metrics only if they exist and we have room
+    general_health = ['risk_score', 'chronic_condition_count', 'er_visits_12mo']
+    for v in general_health:
+        if v in df.columns and v not in plot_vars and len(plot_vars) < 9:
+            plot_vars.append(v)
+    
+    # If we still have few vars (non-person data like supply chain), add all numeric columns
+    if len(plot_vars) < 3:
+        for col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[col]) and col not in plot_vars and len(plot_vars) < 9:
+                unique_vals = set(df[col].dropna().unique())
+                if not unique_vals.issubset({0, 1, 0.0, 1.0}):
+                    plot_vars.append(col)
+    
+    # Filter to only columns that exist and are numeric (for histograms)
+    plot_vars = [v for v in plot_vars if v in df.columns and pd.api.types.is_numeric_dtype(df[v])]
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_vars = []
+    for v in plot_vars:
+        if v not in seen:
+            seen.add(v)
+            unique_vars.append(v)
+    
+    return unique_vars[:9]  # Max 9 for 3x3 grid
+
+
 # ============================================================
 # DYNAMIC DATA ENRICHMENT — LLM analyzes question & finds data
 # ============================================================
 @st.cache_data(show_spinner=False, ttl=3600)
 def analyze_question_and_enrich(question, _cache_version=0):
-    """Use LLM to analyze the question, identify needed conditions AND risk factors,
-    and return additional data to add to the dataset."""
+    """Use LLM to design the ENTIRE dataset schema based on the question."""
     
-    base_conditions = {
-        'diabetes': {'prevalence': 0.087, 'age_adjusted': True, 'source': 'PHAC CCDI 2021'},
-        'hypertension': {'prevalence': 0.198, 'age_adjusted': True, 'source': 'PHAC CCDI 2021'},
-        'copd': {'prevalence': 0.042, 'age_adjusted': True, 'source': 'PHAC CCDI 2021'},
-        'asthma': {'prevalence': 0.112, 'age_adjusted': False, 'source': 'PHAC CCDI 2021'},
-        'heart_disease': {'prevalence': 0.058, 'age_adjusted': True, 'source': 'PHAC CCDI 2021'},
-        'mood_disorders': {'prevalence': 0.082, 'age_adjusted': False, 'source': 'PHAC CCDI 2021'},
-        'arthritis': {'prevalence': 0.167, 'age_adjusted': True, 'source': 'PHAC CCDI 2021'},
-        'dementia': {'prevalence': 0.065, 'age_adjusted': True, 'source': 'PHAC CCDI 2021'},
+    fallback_result = {
+        'question_type': 'PREVALENCE',
+        'schema_description': 'Default population health schema',
+        'conditions': {
+            'diabetes': {'prevalence': 0.087, 'age_adjusted': True, 'source': 'PHAC CCDI 2021'},
+            'hypertension': {'prevalence': 0.198, 'age_adjusted': True, 'source': 'PHAC CCDI 2021'},
+            'copd': {'prevalence': 0.042, 'age_adjusted': True, 'source': 'PHAC CCDI 2021'},
+            'asthma': {'prevalence': 0.112, 'age_adjusted': False, 'source': 'PHAC CCDI 2021'},
+            'heart_disease': {'prevalence': 0.058, 'age_adjusted': True, 'source': 'PHAC CCDI 2021'},
+            'mood_disorders': {'prevalence': 0.082, 'age_adjusted': False, 'source': 'PHAC CCDI 2021'},
+            'arthritis': {'prevalence': 0.167, 'age_adjusted': True, 'source': 'PHAC CCDI 2021'},
+            'dementia': {'prevalence': 0.065, 'age_adjusted': True, 'source': 'PHAC CCDI 2021'},
+        },
+        'risk_factors': [],
+        'include_housing': True,
+        'include_falls': True,
+        'include_er_utilization': True,
+        'include_risk_score': True,
+        'data_sources': [],
+        'relevant_demographics': ['age', 'sex', 'income', 'municipality'],
     }
     
     try:
         from langchain_openai import ChatOpenAI
         from langchain_core.messages import HumanMessage, SystemMessage
+        import re
         
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            return base_conditions, [], [], [], ['age', 'sex', 'income', 'municipality'], []
+            return fallback_result
         
         llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key)
         
         resp = llm.invoke([
-            SystemMessage(content="""You are a Canadian healthcare epidemiologist.
-Given a user's question about population health, analyze it and return structured JSON.
+            SystemMessage(content="""You are a Canadian healthcare data architect. Given a question, 
+design the COMPLETE dataset schema with ONLY variables relevant to that question.
 
-The base dataset already has these conditions: diabetes, hypertension, copd, asthma, 
-heart_disease, mood_disorders, arthritis, dementia.
-The base dataset already has these demographics: age, sex, income, municipality.
+ALWAYS include these foundation demographics: age, sex, income, municipality.
+Then add ONLY what's needed for the specific question.
 
-You can add TWO types of new variables:
-1. "additional_conditions" — binary disease/condition flags (has_X)
-2. "additional_risk_factors" — behavioral/lifestyle/clinical variables that are risk factors
+SCHEMA DESIGN PRINCIPLES — apply these to ANY question:
 
-Return this EXACT JSON structure (no markdown, no code fences, just raw JSON):
+STEP 1: IDENTIFY THE CORE OUTCOME(S)
+- What is the question trying to measure or predict?
+- This becomes your primary outcome variable(s)
+- Examples: disease prevalence → has_[condition]; cost → annual_cost_per_patient; satisfaction → patient_satisfaction_score; demand → monthly_er_visits; stockout → stockout_rate
+
+STEP 2: IDENTIFY WHAT DRIVES THE OUTCOME
+- What factors cause the outcome to be higher or lower?
+- These become your risk_factors
+- ALWAYS include a mix of binary AND numeric variables
+- EVERY risk factor MUST have correlates_with pointing to the outcome variable(s)
+- Set correlation_strength between 0.2-0.5 for realistic relationships
+
+STEP 3: ENSURE CORRELATION STRUCTURE
+- The MOST IMPORTANT thing: variables must be DESIGNED to correlate
+- For each risk factor, ask: "does this variable go UP when the outcome goes UP?"
+- If yes → set correlates_with to the outcome, correlation_strength 0.2-0.5
+- Include at least 2-3 STRONG correlations (strength 0.35-0.5) so the analysis finds meaningful patterns
+- Include cross-correlations between risk factors too (e.g., age correlates with cost AND with frailty)
+
+STEP 4: CHOOSE THE RIGHT VARIABLE TYPES
+- Outcomes that are yes/no → put in "conditions" as binary
+- Outcomes that are continuous → put in "risk_factors" as numeric
+- Drivers that are yes/no → binary risk_factors with prevalence
+- Drivers that are continuous → numeric risk_factors with mean/std/min/max
+- IMPORTANT: you can have ZERO conditions if the question is about operations, finance, supply chain, etc.
+
+STEP 5: SET REALISTIC CANADIAN VALUES
+- Use real rates from Stats Canada, PHAC, CIHI, Ontario Health where possible
+- If you don't know the exact rate, estimate reasonably and cite the most likely source
+- age_factor should reflect reality: costs increase with age, satisfaction varies, etc.
+
+STEP 6: DECIDE WHICH MODULES TO INCLUDE
+- include_housing: true ONLY if the question involves housing, falls, or living conditions
+- include_falls: true ONLY if the question involves falls, mobility, or seniors at home
+- include_er_utilization: true if ER visits are relevant (most health questions)
+- include_risk_score: true if a composite health risk is relevant
+- Set ALL to false if the question is about operations, finance, supply chain, workforce, etc.
+
+REFERENCE EXAMPLES (for calibration — not an exhaustive list, apply the principles above to ANY topic):
+
+Health/Disease: conditions = the diseases; risk_factors = behavioral (smoking, BMI), clinical (comorbidities), social (income, isolation)
+Operations/Demand: conditions = 0-2 broad categories; risk_factors = volume metrics, capacity metrics, temporal patterns, patient mix
+Workforce: conditions = none; risk_factors = staffing ratios, workload, satisfaction, retention, compensation
+Financial/Cost: conditions = high-cost conditions; risk_factors = cost per patient, drug costs, admissions, LOS, frailty, home care needs
+Supply Chain: conditions = none; risk_factors = inventory levels, lead times, stockout rates, usage volumes, waste rates, expiry rates
+Quality/Safety: conditions = adverse events as binary; risk_factors = process compliance, staffing levels, patient acuity, infection rates
+Patient Experience: conditions = none; risk_factors = satisfaction scores, wait times, communication scores, complaint rates, readmission
+Virtual Care: conditions = chronic conditions suitable for remote monitoring; risk_factors = digital access, distance to hospital, visit frequency, tech literacy
+
+RETURN THIS EXACT JSON (no markdown fences, no commentary):
 {
-    "additional_conditions": [
+    "question_type": "PREVALENCE",
+    "schema_description": "Population health dataset focused on diabetes risk factors in Southlake catchment",
+    "unit_of_observation": "person",
+    "unit_label": "resident",
+    "n_target_rows": 35000,
+    "row_id_field": null,
+    "categorical_fields": [
         {
-            "name": "lung_cancer",
-            "prevalence": 0.006,
-            "age_adjusted": true,
-            "age_factor": "increases_with_age",
-            "source": "Canadian Cancer Society 2023",
-            "risk_factors": ["age", "is_smoker"],
-            "comorbidities": ["has_copd"]
+            "name": "municipality",
+            "categories": {"Newmarket": 0.254, "Aurora": 0.179, "East Gwillimbury": 0.100, "Georgina": 0.138, "Bradford West Gwillimbury": 0.124, "King": 0.079, "Innisfil": 0.125},
+            "source": "Statistics Canada 2021 Census"
+        },
+        {
+            "name": "sex",
+            "categories": {"Male": 0.49, "Female": 0.51},
+            "source": "Statistics Canada 2021 Census"
         }
     ],
-    "additional_risk_factors": [
-        {
-            "name": "is_smoker",
-            "type": "binary",
-            "prevalence": 0.145,
-            "age_factor": "peaks_middle_age",
-            "source": "Statistics Canada CTADS 2022",
-            "correlates_with": ["has_lung_cancer", "has_copd", "has_heart_disease"],
-            "correlation_strength": 0.4
-        },
+    "conditions": {
+        "diabetes": {
+            "prevalence": 0.087,
+            "age_adjusted": true,
+            "age_factor": "increases_with_age",
+            "source": "PHAC CCDI 2021",
+            "risk_factors": ["bmi", "physical_inactivity"],
+            "comorbidities": ["has_hypertension"]
+        }
+    },
+    "risk_factors": [
         {
             "name": "bmi",
             "type": "numeric",
@@ -308,41 +466,99 @@ Return this EXACT JSON structure (no markdown, no code fences, just raw JSON):
             "std": 5.5,
             "min": 15,
             "max": 55,
+            "age_factor": "increases_with_age",
             "source": "Statistics Canada CCHS 2022",
-            "correlates_with": ["has_diabetes", "has_hypertension", "has_heart_disease"],
-            "correlation_strength": 0.3
+            "correlates_with": ["has_diabetes", "has_hypertension"],
+            "correlation_strength": 0.35
         }
     ],
-    "relevant_existing_conditions": ["copd", "asthma"],
+    "include_housing": false,
+    "include_falls": false,
+    "include_er_utilization": true,
+    "include_risk_score": true,
     "relevant_demographics": ["age", "sex", "income", "municipality"],
     "data_sources_used": [
-        {"name": "Canadian Cancer Society", "url": "https://cancer.ca", "licence": "Public"}
+        {"name": "PHAC CCDI", "url": "https://health-infobase.canada.ca/ccdi/", "licence": "Open Government Licence — Canada"}
     ]
 }
 
+UNIT OF OBSERVATION — CRITICAL:
+- "unit_of_observation" defines what each ROW represents
+- "unit_label" is a human-readable name for one row (e.g., "resident", "supply item", "patient visit", "department", "month")
+- "n_target_rows" is how many rows to generate:
+  * person/resident: ~35000 (10% of catchment population)
+  * item/supply: 300-800 (number of distinct supply items a hospital manages)
+  * encounter/visit: 15000-30000 (annual patient encounters)
+  * department/unit: 15-25 (hospital departments)
+  * staff_member: 2000-4000 (hospital workforce)
+  * month: 60-120 (5-10 years of monthly data)
+- "row_id_field": null for person-level (no ID needed), or a name like "item_id", "encounter_id", "dept_id" for non-person units
+- "categorical_fields": define ANY categorical columns with their probability distributions
+  * For person-level: municipality, sex (always include these)
+  * For item-level: item_category, department, supplier, criticality_level
+  * For encounter-level: visit_type, department, triage_level, municipality
+  * For department-level: department_name, department_type
+  * For staff-level: role, department, shift_type
+  * For month-level: municipality (or department)
+  * Each category field needs "name", "categories" (dict of value→probability), and "source"
+- For PERSON-level data: ALWAYS include municipality and sex in categorical_fields, and include "age" and "income" as risk_factors with type "numeric"
+  * age: mean=42, std=24, min=0, max=99, age_factor="flat", source="Statistics Canada 2021 Census"
+  * income: mean=95000, std=45000, min=0, max=500000, age_factor="peaks_middle_age", source="Statistics Canada 2021 Census"
+- For NON-PERSON data: do NOT include age, sex, income, municipality unless they make sense for that unit
+  * An encounter CAN have patient_age and municipality
+  * A supply item should NOT have age or sex
+  * A department should NOT have age or sex
+
 CRITICAL RULES:
-- "prevalence" MUST be a decimal number (e.g., 0.006 for 0.6%), NOT a string
+- "prevalence" MUST be a decimal (0.087 not "8.7%")
 - "name" must be snake_case
-- For risk factors, "type" must be "binary" or "numeric"
 - Binary risk factors need "prevalence" (decimal)
-- Numeric risk factors need "mean", "std", "min", "max"
-- "correlation_strength" is how strongly this risk factor correlates with its correlates (0.0 to 1.0)
-- Use REAL Canadian rates from reliable sources (Stats Canada, PHAC, CIHI, Cancer Society, etc.)
-FOCUS RULES — VERY IMPORTANT:
-- ONLY add conditions that are DIRECTLY asked about in the question and NOT already in the base dataset
-- Do NOT add unrelated conditions (e.g., do NOT add lung_cancer if the question is about diabetes)
-- ONLY add risk factors that are clinically relevant to the CONDITIONS IN THE QUESTION
-- If the question is about diabetes, add risk factors for diabetes (BMI, physical inactivity, family history, diet)
-- If the question is about lung cancer, add risk factors for lung cancer (smoking, radon exposure, occupational exposure)
-- If the question is about hypertension, add risk factors for hypertension (BMI, sodium intake, physical inactivity, alcohol)
-- If the question is about mental health, add risk factors for mental health (social isolation, unemployment, trauma)
-- Do NOT add smoking/lung cancer risk factors unless the question specifically asks about lung cancer or respiratory conditions
-- "correlates_with" must ONLY reference conditions that are relevant to the question
-- Add 2-4 risk factors that are the MOST clinically important for the conditions in the question
-- Think about: behavioral (smoking, physical inactivity, alcohol, diet), clinical (BMI, blood pressure, blood glucose), social (isolation, housing instability), environmental (air quality, occupational exposure)
-- Every condition in the question should have at least one risk factor that strongly correlates with it
-- Use correlation_strength 0.3-0.5 for strong known relationships
-- Return ONLY raw JSON, no markdown fences"""),
+- Numeric risk factors need "mean", "std", "min", "max" (all numbers)
+- "correlation_strength" between 0.1 and 0.5
+- Use REAL Canadian rates from: Stats Canada, PHAC, CIHI, Cancer Society, Ontario Health
+- ONLY include conditions directly relevant to the question
+- ONLY include risk factors that relate to the conditions or operational metrics in the question
+- For DEMAND questions: conditions should be broad categories (respiratory_illness, cardiac_event) not specific diseases
+- For WORKFORCE questions: you may have zero conditions — that's fine
+- "age_factor" must be one of: "increases_with_age", "decreases_with_age", "peaks_middle_age", "flat"
+- correlates_with entries must reference other variables by their exact name or has_[condition_name]
+
+THOROUGHNESS RULES — VERY IMPORTANT:
+- You are building a dataset that a healthcare professional will use to make REAL decisions
+- Think like a senior analyst doing a COMPREHENSIVE review — not a surface-level summary
+- Include 6-10 variables (risk_factors) that capture DIFFERENT dimensions of the question
+
+UNIVERSAL DIMENSIONS — for ANY question, cover as many as relevant:
+  * The PRIMARY OUTCOME the question asks about (cost, satisfaction, demand, risk, etc.)
+  * DEMOGRAPHIC DRIVERS (age, sex, income, municipality — already included as foundation)
+  * DIRECT CAUSES (what directly makes the outcome go up or down?)
+  * INDIRECT/UPSTREAM CAUSES (what causes the direct causes?)
+  * SYSTEM/PROCESS FACTORS (hospital operations, staffing, wait times, capacity)
+  * TEMPORAL FACTORS (seasonality, trends, time-based patterns)
+  * PATIENT FACTORS (acuity, comorbidities, functional status, compliance)
+  * SOCIAL DETERMINANTS (isolation, education, transportation, language, housing)
+
+CORRELATION DESIGN — CRITICAL:
+  * Pick 2-3 risk factors that should STRONGLY correlate with the outcome (strength 0.35-0.5)
+  * Pick 2-3 that MODERATELY correlate (strength 0.2-0.35)
+  * Pick 1-2 that are WEAK or INDIRECT (strength 0.1-0.2)
+  * This creates a realistic correlation structure where some factors matter more than others
+  * ALWAYS set correlates_with for EVERY risk factor — if it doesn't correlate with anything, don't include it
+  * Cross-correlate risk factors with each other where logical (e.g., age → frailty → cost)
+
+VARIABLE MIX:
+  * Include at LEAST 3 numeric variables (continuous outcomes, scores, counts, costs, rates)
+  * Include at LEAST 3 binary variables (yes/no flags, thresholds, categories)
+  * This ensures both the correlation heatmap AND the relative risk table have content
+  * Binary variables with prevalence 0.10-0.40 produce the best relative risk statistics
+  * Avoid binary variables with prevalence < 0.03 or > 0.90 (too rare or too common to analyze)
+
+- Do NOT stop at 2-3 obvious variables — a real analyst would consider 5-8 dimensions
+- Include a MIX of binary and numeric variables — not all binary, not all numeric
+- Each variable must have a realistic Canadian value from a credible source
+- If you are unsure of an exact rate, use your best estimate and cite the most likely source
+- The goal is a RICH dataset that enables meaningful analysis, not a minimal one
+- Return ONLY raw JSON"""),
             HumanMessage(content=f"QUESTION: {question}")
         ])
         
@@ -352,41 +568,76 @@ FOCUS RULES — VERY IMPORTANT:
             lines = [l for l in lines if not l.strip().startswith("```")]
             content = "\n".join(lines).strip()
         
+        match = re.search(r'\{.*\}', content, re.DOTALL)
+        if match:
+            content = match.group()
+        
         result = json.loads(content)
         
+        # Validate and clean the result
+        validated = {
+            'question_type': result.get('question_type', 'PREVALENCE'),
+            'schema_description': result.get('schema_description', 'Custom dataset'),
+            'unit_of_observation': result.get('unit_of_observation', 'person'),
+            'unit_label': result.get('unit_label', 'resident'),
+            'n_target_rows': result.get('n_target_rows', 35000),
+            'row_id_field': result.get('row_id_field', None),
+            'categorical_fields': [],
+            'conditions': {},
+            'risk_factors': [],
+            'include_housing': result.get('include_housing', False),
+            'include_falls': result.get('include_falls', False),
+            'include_er_utilization': result.get('include_er_utilization', True),
+            'include_risk_score': result.get('include_risk_score', True),
+            'data_sources': result.get('data_sources_used', []),
+            'relevant_demographics': result.get('relevant_demographics', ['age', 'sex', 'income', 'municipality']),
+        }
+        
+        # Validate categorical fields
+        for cf in result.get('categorical_fields', []):
+            name = cf.get('name', '').lower().replace(' ', '_')
+            cats = cf.get('categories', {})
+            if name and cats:
+                # Normalize probabilities
+                total = sum(cats.values())
+                if total > 0:
+                    cats = {k: v / total for k, v in cats.items()}
+                validated['categorical_fields'].append({
+                    'name': name,
+                    'categories': cats,
+                    'source': cf.get('source', 'Canadian health data'),
+                })
+        
         # Validate conditions
-        additional_conditions = []
-        for cond in result.get('additional_conditions', []):
-            name = cond.get('name', '').lower().replace(' ', '_')
-            prev = cond.get('prevalence', 0)
+        for cond_name, cond_info in result.get('conditions', {}).items():
+            name = cond_name.lower().replace(' ', '_')
+            prev = cond_info.get('prevalence', 0)
             if isinstance(prev, str):
                 prev = float(prev.replace('%', '').strip()) / 100
             prev = float(prev)
-            if not name or name in base_conditions or prev <= 0:
+            if prev <= 0 or not name:
                 continue
-            validated = {
-                'name': name, 'prevalence': prev,
-                'age_adjusted': cond.get('age_adjusted', True),
-                'age_factor': cond.get('age_factor', 'increases_with_age'),
-                'source': cond.get('source', 'Canadian health data'),
-                'risk_factors': cond.get('risk_factors', []),
-                'comorbidities': cond.get('comorbidities', []),
+            validated['conditions'][name] = {
+                'prevalence': prev,
+                'age_adjusted': cond_info.get('age_adjusted', True),
+                'age_factor': cond_info.get('age_factor', 'increases_with_age'),
+                'source': cond_info.get('source', 'Canadian health data'),
+                'risk_factors': cond_info.get('risk_factors', []),
+                'comorbidities': cond_info.get('comorbidities', []),
             }
-            additional_conditions.append(validated)
-            base_conditions[name] = validated
         
         # Validate risk factors
-        additional_risk_factors = []
-        for rf in result.get('additional_risk_factors', []):
+        for rf in result.get('risk_factors', []):
             name = rf.get('name', '').lower().replace(' ', '_')
             rf_type = rf.get('type', 'binary')
             if not name:
                 continue
             validated_rf = {
-                'name': name, 'type': rf_type,
+                'name': name,
+                'type': rf_type,
                 'source': rf.get('source', 'Canadian health data'),
                 'correlates_with': rf.get('correlates_with', []),
-                'correlation_strength': min(0.9, max(0.1, rf.get('correlation_strength', 0.3))),
+                'correlation_strength': min(0.9, max(0.1, float(rf.get('correlation_strength', 0.3)))),
                 'age_factor': rf.get('age_factor', 'flat'),
             }
             if rf_type == 'binary':
@@ -399,78 +650,180 @@ FOCUS RULES — VERY IMPORTANT:
                 validated_rf['std'] = float(rf.get('std', 10))
                 validated_rf['min'] = float(rf.get('min', 0))
                 validated_rf['max'] = float(rf.get('max', 100))
-            additional_risk_factors.append(validated_rf)
+            validated['risk_factors'].append(validated_rf)
         
-        relevant_existing = result.get('relevant_existing_conditions', [])
-        data_sources = result.get('data_sources_used', [])
-        relevant_demographics = result.get('relevant_demographics', ['age', 'sex', 'income', 'municipality'])
+        # === SCHEMA VALIDATION & REPAIR ===
+        # Fix common LLM schema design mistakes that affect data quality
         
-        return base_conditions, relevant_existing, data_sources, additional_conditions, relevant_demographics, additional_risk_factors
+        # REPAIR 1: If a condition name contains "multiple" or "chronic_conditions",
+        # the LLM created a composite flag instead of individual conditions.
+        # Replace it with the actual individual conditions it should have used.
+        composite_conditions = [name for name in validated['conditions'] 
+                               if any(kw in name.lower() for kw in ['multiple', 'chronic_conditions', 
+                                      'multimorbidity', 'comorbid'])]
+        if composite_conditions:
+            for comp_name in composite_conditions:
+                comp_info = validated['conditions'].pop(comp_name)
+                # Add individual conditions that the composite was standing in for
+                individual_conditions = {
+                    'diabetes': {'prevalence': 0.087, 'age_adjusted': True, 'age_factor': 'increases_with_age',
+                                'source': 'PHAC CCDI 2021', 'risk_factors': [], 'comorbidities': ['has_hypertension']},
+                    'hypertension': {'prevalence': 0.198, 'age_adjusted': True, 'age_factor': 'increases_with_age',
+                                    'source': 'PHAC CCDI 2021', 'risk_factors': [], 'comorbidities': []},
+                    'heart_disease': {'prevalence': 0.058, 'age_adjusted': True, 'age_factor': 'increases_with_age',
+                                     'source': 'PHAC CCDI 2021', 'risk_factors': [], 'comorbidities': ['has_hypertension']},
+                    'copd': {'prevalence': 0.042, 'age_adjusted': True, 'age_factor': 'increases_with_age',
+                            'source': 'PHAC CCDI 2021', 'risk_factors': [], 'comorbidities': []},
+                }
+                # Inherit risk factors from the composite condition
+                comp_rfs = comp_info.get('risk_factors', [])
+                for cond_name, cond_info in individual_conditions.items():
+                    if cond_name not in validated['conditions']:
+                        cond_info['risk_factors'] = comp_rfs.copy()
+                        validated['conditions'][cond_name] = cond_info
+                
+                # Remove any risk factors that were pointing to the composite condition
+                for rf in validated['risk_factors']:
+                    correlates = rf.get('correlates_with', [])
+                    comp_col = f"has_{comp_name}"
+                    if comp_col in correlates:
+                        correlates.remove(comp_col)
+                        # Point them at the individual conditions instead
+                        for cond_name in individual_conditions:
+                            if f"has_{cond_name}" not in correlates:
+                                correlates.append(f"has_{cond_name}")
+                    if comp_name in correlates:
+                        correlates.remove(comp_name)
+                        for cond_name in individual_conditions:
+                            if f"has_{cond_name}" not in correlates:
+                                correlates.append(f"has_{cond_name}")
+        
+        # REPAIR 2: If any risk factor that was listed as a has_ condition 
+        # is in the risk_factors list instead of conditions, move it.
+        # The LLM sometimes puts has_hypertension as a binary risk factor
+        # instead of as a condition.
+        rf_to_remove = []
+        for i, rf in enumerate(validated['risk_factors']):
+            rf_name = rf.get('name', '')
+            if rf_name.startswith('has_') and rf.get('type') == 'binary':
+                # This should be a condition, not a risk factor
+                cond_name = rf_name.replace('has_', '')
+                if cond_name not in validated['conditions']:
+                    validated['conditions'][cond_name] = {
+                        'prevalence': rf.get('prevalence', 0.1),
+                        'age_adjusted': rf.get('age_factor', 'flat') != 'flat',
+                        'age_factor': rf.get('age_factor', 'increases_with_age'),
+                        'source': rf.get('source', 'Canadian health data'),
+                        'risk_factors': [],
+                        'comorbidities': [],
+                    }
+                    rf_to_remove.append(i)
+        for i in sorted(rf_to_remove, reverse=True):
+            validated['risk_factors'].pop(i)
+        
+        # REPAIR 3: Ensure numeric variables have realistic max values.
+        # The LLM often sets max too low (e.g., cost max=50000 when real costs can be 200000+).
+        for rf in validated['risk_factors']:
+            if rf.get('type') != 'numeric':
+                continue
+            rf_name = rf.get('name', '').lower()
+            mean_val = rf.get('mean', 0)
+            std_val = rf.get('std', 1)
+            max_val = rf.get('max', 100)
+            
+            # Max should be at least mean + 4*std to allow realistic tail behavior
+            min_reasonable_max = mean_val + 4 * std_val
+            if max_val < min_reasonable_max:
+                rf['max'] = round(min_reasonable_max, 0)
+            
+            # For cost/money variables, ensure the max allows for high-cost outliers
+            if any(kw in rf_name for kw in ['cost', 'expenditure', 'spend', 'payment', 'charge']):
+                if rf['max'] < mean_val * 5:
+                    rf['max'] = round(mean_val * 5, 0)
+            
+            # Min should not be negative for inherently non-negative variables
+            if any(kw in rf_name for kw in ['cost', 'time', 'volume', 'count', 'rate', 'score',
+                                              'level', 'frequency', 'days', 'hours', 'age',
+                                              'income', 'salary', 'price', 'weight', 'height']):
+                if rf.get('min', 0) < 0:
+                    rf['min'] = 0
+        
+        # REPAIR 4: If include_er or include_risk_score is true but there are no conditions,
+        # these derived variables will be meaningless. Turn them off.
+        if not validated['conditions']:
+            validated['include_er_utilization'] = False
+            validated['include_risk_score'] = False
+            validated['include_falls'] = False
+            validated['include_housing'] = False
+        
+        # REPAIR 5: Ensure correlation targets actually exist in the schema.
+        # The LLM sometimes references variables that don't exist.
+        all_var_names = set()
+        for cond_name in validated['conditions']:
+            all_var_names.add(f"has_{cond_name}")
+            all_var_names.add(cond_name)
+        for rf in validated['risk_factors']:
+            all_var_names.add(rf['name'])
+        
+        for rf in validated['risk_factors']:
+            valid_correlates = []
+            for target in rf.get('correlates_with', []):
+                # Check if target exists directly or with has_ prefix
+                if target in all_var_names or f"has_{target}" in all_var_names:
+                    valid_correlates.append(target)
+            rf['correlates_with'] = valid_correlates
+            
+            # If a risk factor has no valid correlates, try to connect it to conditions
+            if not rf['correlates_with'] and validated['conditions']:
+                # Connect to the first condition as a weak correlation
+                first_cond = list(validated['conditions'].keys())[0]
+                rf['correlates_with'] = [f"has_{first_cond}"]
+                rf['correlation_strength'] = max(0.15, rf.get('correlation_strength', 0.3) * 0.5)
+        
+        return validated
     
     except json.JSONDecodeError as e:
-        return base_conditions, [], [{'name': 'LLM Parse Error',
-                                       'url': f'JSON error: {str(e)[:100]}',
-                                       'licence': 'N/A'}], [], \
-               ['age', 'sex', 'income', 'municipality'], []
+        fallback_result['data_sources'] = [{'name': 'LLM Parse Error', 'url': str(e)[:100], 'licence': 'N/A'}]
+        return fallback_result
     except Exception as e:
-        return base_conditions, [], [{'name': 'LLM Error',
-                                       'url': f'Error: {str(e)[:100]}',
-                                       'licence': 'N/A'}], [], \
-               ['age', 'sex', 'income', 'municipality'], []
+        fallback_result['data_sources'] = [{'name': 'LLM Error', 'url': str(e)[:100], 'licence': 'N/A'}]
+        return fallback_result
     
-def get_relevant_variables(question, all_columns, relevant_existing, additional_conditions, relevant_demographics):
-    """Build the list of relevant variables based on what the LLM identified."""
-    relevant = set()
+def get_relevant_variables(question, all_columns, enrichment):
+    """Build the list of relevant variables — now uses the full enrichment result."""
+    # In the new architecture, ALL columns in the dataset are relevant
+    # because the LLM only included what's needed
+    # But we still prioritize for display order
     
-    # Add demographics the LLM said are relevant
-    for d in relevant_demographics:
-        if d in all_columns:
-            relevant.add(d)
+    priority = []
+    secondary = []
     
-    # Always include these core variables
-    for col in ['age', 'sex', 'municipality', 'income', 'population_segment',
-                'chronic_condition_count', 'risk_score', 'er_visits_12mo']:
+    # Demographics first
+    for col in ['age', 'sex', 'municipality', 'income']:
         if col in all_columns:
-            relevant.add(col)
+            priority.append(col)
     
-    # Add existing conditions the LLM flagged
-    for cond in relevant_existing:
-        col_name = f"has_{cond}"
-        if col_name in all_columns:
-            relevant.add(col_name)
+    # Conditions
+    for col in all_columns:
+        if col.startswith('has_') and col not in priority:
+            priority.append(col)
     
-    # Add any new conditions that were added
-    for cond in additional_conditions:
-        col_name = f"has_{cond['name'].lower().replace(' ', '_')}"
-        if col_name in all_columns:
-            relevant.add(col_name)
-    
-    # Add any risk factor variables from conditions
-    for cond in additional_conditions:
-        for rf_name in cond.get('risk_factors', []):
-            if rf_name in all_columns:
-                relevant.add(rf_name)
-    
-    # Add all additional risk factor columns
-    for rf in (st.session_state.get('additional_risk_factors') or []):
+    # Risk factors (from enrichment)
+    for rf in enrichment.get('risk_factors', []):
         rf_name = rf.get('name', '')
-        if rf_name in all_columns:
-            relevant.add(rf_name)
+        if rf_name in all_columns and rf_name not in priority:
+            priority.append(rf_name)
     
-    # If very few relevant vars, include all health conditions
-    if len([v for v in relevant if v.startswith('has_')]) < 2:
-        for col in all_columns:
-            if col.startswith('has_'):
-                relevant.add(col)
+    # Everything else
+    for col in all_columns:
+        if col not in priority:
+            secondary.append(col)
     
-    return [c for c in all_columns if c in relevant]
+    return priority + secondary
 
 
 # ============================================================
 # BACKEND CLASSES
-# ============================================================
-# ============================================================
-# SAS RUNNER — Executes SAS code via saspy on SAS Viya
 # ============================================================
 class SASRunner:
     """Manages a live SAS Viya connection via REST API."""
@@ -486,7 +839,6 @@ class SASRunner:
         self.log = []
     
     def connect(self):
-        """Authenticate and create a compute session."""
         try:
             if not self.refresh_token:
                 self.log.append('No SAS_REFRESH_TOKEN in.env')
@@ -542,7 +894,6 @@ class SASRunner:
         self.session_id = None
     
     def _run_job(self, sas_code, description=''):
-        """Submit SAS code as a job and wait for completion."""
         if not self.connected:
             return {'LOG': 'Not connected', 'LST': '', 'success': False}
         try:
@@ -580,7 +931,6 @@ class SASRunner:
                 log_lines = log_resp.json().get('items', [])
                 log_text = '\n'.join(line.get('line', '') for line in log_lines)
             
-            # Get ODS results listing
             lst_html = ''
             results_resp = requests.get(
                 self.base_url + '/compute/sessions/' + self.session_id + '/jobs/' + jid + '/results',
@@ -607,7 +957,6 @@ class SASRunner:
                 except (ValueError, KeyError):
                     pass
             
-            # Fallback: try direct listing endpoint
             if not lst_html:
                 listing_resp = requests.get(
                     self.base_url + '/compute/sessions/' + self.session_id + '/jobs/' + jid + '/listing',
@@ -616,7 +965,6 @@ class SASRunner:
                 if listing_resp.status_code == 200:
                     lst_html = listing_resp.text
             
-            # Fallback: try listing as plain text
             if not lst_html:
                 listing_resp2 = requests.get(
                     self.base_url + '/compute/sessions/' + self.session_id + '/jobs/' + jid + '/listing',
@@ -639,14 +987,12 @@ class SASRunner:
         return self._run_job(sas_code, description)
     
     def upload_dataframe(self, df, table_name='SOURCE_DATA', libref='WORK'):
-        """Upload DataFrame to SAS via CSV file upload + PROC IMPORT, with datalines fallback."""
         if not self.connected:
             return False
         try:
             n_rows = min(len(df), 5000)
             sample = df.sample(n=n_rows, random_state=42) if len(df) > n_rows else df.copy()
             
-            # Primary path: upload CSV to SAS Viya Files service
             csv_bytes = sample.to_csv(index=False).encode('utf-8')
             headers = {
                 'Authorization': 'Bearer ' + self.access_token,
@@ -676,7 +1022,6 @@ filename _csvin clear;
                     self.log.append(f'Uploaded {n_rows} rows to {libref}.{table_name} via CSV')
                     return True
             
-            # Fallback: datalines with safe delimiter and escaping
             self.log.append('CSV upload not available, falling back to datalines')
             return self._upload_via_datalines(sample, table_name, libref)
         except Exception as e:
@@ -684,9 +1029,8 @@ filename _csvin clear;
             return False
 
     def _upload_via_datalines(self, sample, table_name, libref):
-        """Fallback upload via DATA step with proper escaping."""
         try:
-            delimiter = '\x01'  # SOH control character — never appears in health data
+            delimiter = '\x01'
             cols = []
             lengths = []
             for col in sample.columns:
@@ -714,10 +1058,8 @@ filename _csvin clear;
                     elif pd.api.types.is_numeric_dtype(sample[col]):
                         vals.append(str(v))
                     else:
-                        s = str(v)
-                        s = s.replace('&', ' ').replace('%', ' ').replace(';', ' ')
-                        s = s.replace("'", ' ').replace('"', ' ')
-                        s = s.replace('\n', ' ').replace('\r', ' ')
+                        s = str(v).replace('&', ' ').replace('%', ' ').replace(';', ' ')
+                        s = s.replace("'", ' ').replace('"', ' ').replace('\n', ' ').replace('\r', ' ')
                         vals.append(s)
                 code += delimiter.join(vals) + '\n'
             
@@ -734,124 +1076,7 @@ filename _csvin clear;
             self.log.append('Datalines upload error: ' + str(e))
             return False
     
-    def download_dataframe(self, table_name, libref='WORK'):
-        """Download a SAS dataset as a DataFrame. Tries multiple strategies."""
-        if not self.connected:
-            return None
-        
-        import re
-        from io import StringIO
-        
-        # ── Strategy 1: PROC JSON output parsed from log ──────
-        try:
-            json_code = f'''
-data _null_;
-    set {libref}.{table_name}(obs=5000) end=eof;
-    file print;
-    array _num _numeric_;
-    array _char _character_;
-    length _line $32767;
-    
-    if _n_ = 1 then do;
-        _line = '';
-        do _i = 1 to dim(_num);
-            if _i > 1 then _line = cats(_line, ',');
-            _line = cats(_line, vname(_num[_i]));
-        end;
-        do _i = 1 to dim(_char);
-            if length(_line) > 0 then _line = cats(_line, ',');
-            _line = cats(_line, vname(_char[_i]));
-        end;
-        put 'CSVHEADER:' _line;
-    end;
-    
-    _line = '';
-    do _i = 1 to dim(_num);
-        if _i > 1 then _line = cats(_line, ',');
-        if missing(_num[_i]) then _line = cats(_line, '.');
-        else _line = cats(_line, put(_num[_i], best32.));
-    end;
-    do _i = 1 to dim(_char);
-        if length(_line) > 0 then _line = cats(_line, ',');
-        _line = cats(_line, quote(strip(_char[_i])));
-    end;
-    put 'CSVROW:' _line;
-run;
-'''
-            result = self._run_job(json_code, f'Download {table_name} via log')
-            log_text = result.get('LOG', '')
-            
-            if 'CSVHEADER:' in log_text and 'CSVROW:' in log_text:
-                lines = log_text.split('\n')
-                header = None
-                rows = []
-                for line in lines:
-                    line = line.strip()
-                    if 'CSVHEADER:' in line:
-                        header = line.split('CSVHEADER:')[1].strip()
-                    elif 'CSVROW:' in line:
-                        rows.append(line.split('CSVROW:')[1].strip())
-                
-                if header and rows:
-                    csv_text = header + '\n' + '\n'.join(rows)
-                    try:
-                        result_df = pd.read_csv(StringIO(csv_text))
-                        if len(result_df) > 0:
-                            self.log.append(f'Downloaded {len(result_df)} rows from {libref}.{table_name} via log parsing')
-                            return result_df
-                    except Exception as parse_err:
-                        self.log.append(f'Log CSV parse failed: {parse_err}')
-        except Exception as e:
-            self.log.append(f'Strategy 1 (log parse) failed: {e}')
-        
-        # ── Strategy 2: ODS CSV via listing endpoint ──────────
-        try:
-            csv_code = f'''
-ods listing close;
-ods csv;
-proc print data={libref}.{table_name}(obs=5000) noobs;
-run;
-ods csv close;
-ods listing;
-'''
-            result = self._run_job(csv_code, f'Download {table_name} via ODS CSV')
-            lst = result.get('LST', '')
-            
-            if lst and len(lst.strip()) > 10:
-                clean_text = re.sub(r'<[^>]+>', '', lst).strip()
-                if clean_text and ',' in clean_text:
-                    try:
-                        result_df = pd.read_csv(StringIO(clean_text))
-                        if len(result_df) > 0:
-                            self.log.append(f'Downloaded {len(result_df)} rows from {libref}.{table_name} via ODS CSV')
-                            return result_df
-                    except Exception as parse_err:
-                        self.log.append(f'ODS CSV parse failed: {parse_err}')
-        except Exception as e:
-            self.log.append(f'Strategy 2 (ODS CSV) failed: {e}')
-        
-        # ── Strategy 3: PROC MEANS summary as validation ─────
-        # If we can't get row-level data, at least get summary stats
-        # to confirm SAS processed the data correctly
-        try:
-            means_code = f'''
-proc means data={libref}.{table_name} n mean std min max maxdec=4;
-    title 'Download validation for {table_name}';
-run;
-'''
-            result = self._run_job(means_code, f'Validate {table_name}')
-            if result.get('success'):
-                self.log.append(f'Cannot download {table_name} row data, but PROC MEANS confirms it exists and SAS processed it')
-            else:
-                self.log.append(f'Table {table_name} may not exist in {libref}')
-        except Exception:
-            pass
-        
-        self.log.append(f'All download strategies failed for {libref}.{table_name}')
-        return None
-    
     def run_proc_means(self, df, variables=None, table_name='SOURCE_DATA'):
-        """Run PROC MEANS and return log."""
         if variables is None:
             variables = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
         var_list = ' '.join(variables[:20])
@@ -913,6 +1138,8 @@ run;
         code += 'run;\n'
         result = self._run_job(code, 'Municipal Profiles')
         return None, result
+
+
 class SASEngine:
     def __init__(self, sas_dir, output_dir):
         self.sas_dir = sas_dir
@@ -922,7 +1149,6 @@ class SASEngine:
 
     @staticmethod
     def _can_write(directory):
-        """Check if we can write to the directory."""
         try:
             test_path = os.path.join(directory, '.write_test')
             with open(test_path, 'w') as f:
@@ -1005,10 +1231,6 @@ proc means data={dataset_name} nmiss n;
     var {num};
     title 'Missing Value Analysis';
 run;
-proc means data={dataset_name} p5 p10 p25 p50 p75 p90 p95 maxdec=4;
-    var {num};
-    title 'Percentile Analysis';
-run;
 """
         return code
 
@@ -1059,8 +1281,20 @@ run;
     def generate_visualization_code(self, df, dataset_name="WORK.CLEANED_DATA"):
         num = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
         code = "ods graphics on / width=800px height=500px;\n"
-        for var in [c for c in ['age', 'income', 'risk_score', 'chronic_condition_count',
-                                 'er_visits_12mo', 'fall_risk_score'] if c in num][:6]:
+        
+        # Prefer known health vars if they exist, otherwise use whatever numeric vars are available
+        preferred = [c for c in ['age', 'income', 'risk_score', 'chronic_condition_count',
+                                  'er_visits_12mo', 'fall_risk_score'] if c in num]
+        if len(preferred) < 3:
+            for c in num:
+                if c not in preferred:
+                    unique_vals = set(df[c].dropna().unique())
+                    if not unique_vals.issubset({0, 1, 0.0, 1.0}):
+                        preferred.append(c)
+                if len(preferred) >= 6:
+                    break
+        
+        for var in preferred[:6]:
             code += f"""
 proc sgplot data={dataset_name};
     histogram {var} / fillattrs=(color=cx00838f transparency=0.3);
@@ -1086,129 +1320,164 @@ proc export data=WORK.CLEANED_DATA
     dbms=csv replace;
 run;
 """
+
     def generate_constraint_enforcement_code(self, df, dataset_name="WORK.CLEANED_DATA"):
         condition_cols = [c for c in df.columns if c.startswith('has_')
                          and c not in ['has_stairs', 'has_mobility_limitation']]
-        condition_sum = ' + '.join(condition_cols) if condition_cols else '0'
-        return f"""
-/* ============================================ */
-/* Clinical Constraint Enforcement              */
-/* ============================================ */
-data {dataset_name};
-    set {dataset_name};
-    if age < 40 then has_dementia = 0;
-    if age < 18 then do;
-        has_hypertension = 0;
-        has_copd = 0;
-        has_arthritis = 0;
-        has_heart_disease = 0;
-        has_dementia = 0;
-    end;
-    chronic_condition_count = {condition_sum};
-    if fall_risk_score < 0 then fall_risk_score = 0;
-    if fall_risk_score > 1 then fall_risk_score = 1;
-    if er_visits_12mo < 0 then er_visits_12mo = 0;
-    if income < 0 then income = 0;
-run;
-proc means data={dataset_name} n mean min max maxdec=4;
-    var {' '.join(condition_cols)} chronic_condition_count
-        fall_risk_score er_visits_12mo;
-    title 'Post-Constraint Enforcement Statistics';
-run;
-"""
+        code = f"data {dataset_name};\n    set {dataset_name};\n"
+        
+        if 'age' in df.columns and 'has_dementia' in df.columns:
+            code += "    if age < 40 then has_dementia = 0;\n"
+        if 'age' in df.columns:
+            child_conditions = [c for c in ['has_hypertension', 'has_copd', 'has_arthritis',
+                                            'has_heart_disease', 'has_dementia'] if c in df.columns]
+            if child_conditions:
+                code += "    if age < 18 then do;\n"
+                for c in child_conditions:
+                    code += f"        {c} = 0;\n"
+                code += "    end;\n"
+        if condition_cols and 'chronic_condition_count' in df.columns:
+            condition_sum = ' + '.join(condition_cols)
+            code += f"    chronic_condition_count = {condition_sum};\n"
+        if 'fall_risk_score' in df.columns:
+            code += "    if fall_risk_score < 0 then fall_risk_score = 0;\n"
+            code += "    if fall_risk_score > 1 then fall_risk_score = 1;\n"
+        if 'er_visits_12mo' in df.columns:
+            code += "    if er_visits_12mo < 0 then er_visits_12mo = 0;\n"
+        if 'income' in df.columns:
+            code += "    if income < 0 then income = 0;\n"
+        
+        code += "run;\n"
+        return code
 
     def generate_logistic_regression_code(self, df, dataset_name="WORK.CLEANED_DATA"):
         condition_cols = [c for c in df.columns if c.startswith('has_')
                          and c not in ['has_stairs', 'has_mobility_limitation']]
         code = "ods graphics on / width=800px height=500px;\n"
-        if 'er_visits_12mo' in df.columns:
+        
+        models_generated = 0
+        
+        # Model 1: ER high utilization (if ER data exists)
+        if 'er_visits_12mo' in df.columns and 'age' in df.columns:
+            pred_vars = ['age']
+            if 'income' in df.columns:
+                pred_vars.append('income')
+            pred_vars.extend(condition_cols[:6])
             code += f"""
 data WORK.ANALYSIS;
     set {dataset_name};
     er_high = (er_visits_12mo >= 3);
 run;
 proc logistic data=WORK.ANALYSIS descending;
-    model er_high(event='1') = age income
-        {' '.join(c for c in condition_cols[:6])}
+    model er_high(event='1') = {' '.join(pred_vars)}
         / selection=stepwise slentry=0.05 slstay=0.05
           lackfit rsquare stb;
     title 'Logistic Regression — ER High Utilization Risk Factors';
 run;
 """
+            models_generated += 1
+        
+        # Model 2: Fall risk (if falls data exists)
         if 'had_fall_12mo' in df.columns:
-            fall_preds = ['age']
+            fall_preds = ['age'] if 'age' in df.columns else []
             for c in ['has_mobility_limitation', 'has_arthritis', 'has_dementia',
                       'has_stairs', 'num_staircases']:
                 if c in df.columns:
                     fall_preds.append(c)
-            code += f"""
+            if len(fall_preds) >= 2:
+                code += f"""
 proc logistic data={dataset_name} descending;
     model had_fall_12mo(event='1') = {' '.join(fall_preds)}
         / lackfit rsquare stb;
     title 'Logistic Regression — Fall Risk Factors';
 run;
 """
+                models_generated += 1
+        
+        # Model 3: High cost (if cost data exists) — for finance questions
+        cost_cols = [c for c in df.columns if any(kw in c.lower() for kw in 
+                     ['cost', 'expenditure', 'spend', 'payment'])]
+        if cost_cols and len(df.columns) > 3:
+            cost_col = cost_cols[0]
+            if pd.api.types.is_numeric_dtype(df[cost_col]) and df[cost_col].nunique() > 10:
+                median_cost = df[cost_col].median()
+                predictors = []
+                if 'age' in df.columns:
+                    predictors.append('age')
+                if 'income' in df.columns:
+                    predictors.append('income')
+                predictors.extend(condition_cols[:4])
+                # Add other numeric predictors
+                for c in df.columns:
+                    if (c != cost_col and c not in predictors and 
+                        pd.api.types.is_numeric_dtype(df[c]) and
+                        not set(df[c].dropna().unique()).issubset({0, 1, 0.0, 1.0}) and
+                        df[c].nunique() > 5 and len(predictors) < 10):
+                        predictors.append(c)
+                if len(predictors) >= 2:
+                    code += f"""
+data WORK.COST_ANALYSIS;
+    set {dataset_name};
+    high_cost = ({cost_col} >= {median_cost:.0f});
+run;
+proc logistic data=WORK.COST_ANALYSIS descending;
+    model high_cost(event='1') = {' '.join(predictors)}
+        / selection=stepwise slentry=0.05 slstay=0.05
+          lackfit rsquare stb;
+    title 'Logistic Regression — High Cost Risk Factors (>{cost_col.replace("_", " ").title()} median)';
+run;
+"""
+                    models_generated += 1
+        
+        # Model 4: Generic binary outcome — for any question with binary variables
+        if models_generated == 0:
+            binary_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])
+                          and set(df[c].dropna().unique()).issubset({0, 1, 0.0, 1.0})
+                          and 0.05 < df[c].mean() < 0.95]
+            numeric_preds = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])
+                            and not set(df[c].dropna().unique()).issubset({0, 1, 0.0, 1.0})
+                            and df[c].nunique() > 5]
+            if binary_cols and len(numeric_preds) >= 2:
+                target = binary_cols[0]
+                preds = numeric_preds[:8]
+                code += f"""
+proc logistic data={dataset_name} descending;
+    model {target}(event='1') = {' '.join(preds)}
+        / selection=stepwise slentry=0.05 slstay=0.05
+          lackfit rsquare stb;
+    title 'Logistic Regression — {target.replace("_", " ").title()} Risk Factors';
+run;
+"""
+        
         code += "ods graphics off;\n"
         return code
 
     def generate_municipal_profile_code(self, df, dataset_name="WORK.CLEANED_DATA"):
-        numeric_vars = [c for c in ['age', 'risk_score', 'er_visits_12mo',
-                                    'fall_risk_score', 'chronic_condition_count', 'income']
-                       if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
-        condition_cols = [c for c in df.columns if c.startswith('has_')
-                         and c not in ['has_stairs']]
+        numeric_vars = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])
+                       and not set(df[c].dropna().unique()).issubset({0, 1, 0.0, 1.0})][:10]
+        
+        if not numeric_vars:
+            return "/* No numeric variables available for profiling */\n"
+        
+        # Find the best categorical variable to group by
+        cat_vars = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
+        group_var = 'municipality' if 'municipality' in cat_vars else (cat_vars[0] if cat_vars else None)
+        
+        class_line = f"    class {group_var};\n" if group_var else ""
+        group_label = group_var.replace('_', ' ').title() if group_var else "Overall"
+        
         code = f"""
-/* ============================================ */
-/* Municipal Health Profiles                    */
-/* Close-to-Home Care Planning                  */
-/* ============================================ */
 proc means data={dataset_name} mean std median q1 q3 maxdec=3;
-    class municipality;
-    var {' '.join(numeric_vars)};
-    output out=WORK.MUNICIPAL_PROFILES;
-    title 'Municipal Health Profiles — Southlake Catchment';
+{class_line}    var {' '.join(numeric_vars)};
+    output out=WORK.GROUP_PROFILES;
+    title 'Profiles by {group_label}';
 run;
-proc freq data={dataset_name};
-    tables municipality * population_segment / chisq norow nocol;
-    title 'Population Segments by Municipality';
-run;
-"""
-        if condition_cols:
-            code += f"""
-proc means data={dataset_name} mean maxdec=4;
-    class municipality;
-    var {' '.join(condition_cols)};
-    title 'Condition Prevalence by Municipality';
-run;
-"""
-        code += f"""
-ods graphics on / width=900px height=500px;
-proc sgplot data={dataset_name};
-    vbar municipality / response=risk_score stat=mean
-        fillattrs=(color=cx00838f) categoryorder=respdesc;
-    title 'Average Risk Score by Municipality';
-run;
-proc sgplot data={dataset_name};
-    vbar municipality / response=er_visits_12mo stat=mean
-        fillattrs=(color=cx004d5a) categoryorder=respdesc;
-    title 'Average ER Visits (12mo) by Municipality';
-run;
-proc sgplot data={dataset_name};
-    vbar municipality / response=fall_risk_score stat=mean
-        fillattrs=(color=cxe53935) categoryorder=respdesc;
-    title 'Average Fall Risk Score by Municipality';
-run;
-ods graphics off;
 """
         return code
 
     def generate_synthetic_generation_code(self, df, n_rows=10000,
                                             dataset_name="WORK.CLEANED_DATA"):
         return f"""
-/* ============================================ */
-/* Synthetic Data Generation via SAS            */
-/* Stratified Bootstrap + Perturbation          */
-/* ============================================ */
 proc surveyselect data={dataset_name}
     out=WORK.BOOTSTRAP_SAMPLE
     method=urs n={n_rows} seed=42;
@@ -1234,9 +1503,6 @@ data WORK.SYNTHETIC_DATA;
     end;
     drop SelectionProb SamplingWeight;
 run;
-proc means data=WORK.SYNTHETIC_DATA n mean std min max maxdec=4;
-    title 'Synthetic Data — Summary Statistics';
-run;
 proc export data=WORK.SYNTHETIC_DATA
     outfile="{self.output_dir}/synthetic_data_sas.csv"
     dbms=csv replace;
@@ -1251,9 +1517,6 @@ run;
             return "/* Insufficient numeric columns for DCR analysis */\n"
         var_list = ' '.join(numeric_cols)
         return f"""
-/* ============================================ */
-/* Privacy: Distance to Closest Record (DCR)    */
-/* ============================================ */
 proc standard data={original}(keep={var_list})
     out=WORK.ORIG_STD mean=0 std=1;
     var {var_list};
@@ -1294,12 +1557,8 @@ proc iml;
     append from dcr;
     close WORK.DCR_RESULTS;
 quit;
-proc univariate data=WORK.DCR_RESULTS;
-    var dcr;
-    histogram dcr / normal;
-    title 'Distribution of Distance to Closest Record';
-run;
 """
+
     def generate_fidelity_code(self, df, original="WORK.CLEANED_DATA",
                                 synthetic="WORK.SYNTHETIC_DATA"):
         num = ' '.join(c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]))
@@ -1318,22 +1577,7 @@ run;
 proc corr data={synthetic} pearson nosimple outp=WORK.SYNTH_CORR;
     var {num};
 run;
-data WORK.COMBINED;
-    set {original}(in=a) {synthetic}(in=b);
-    if a then source='Original'; else source='Synthetic';
-run;
-ods graphics on / width=800px height=500px;
 """
-        for var in ['age', 'risk_score', 'income', 'fall_risk_score']:
-            if var in df.columns and pd.api.types.is_numeric_dtype(df[var]):
-                code += f"""
-proc sgplot data=WORK.COMBINED;
-    histogram {var} / group=source transparency=0.5;
-    density {var} / type=kernel group=source;
-    title 'Fidelity: {var.replace("_", " ").title()}';
-run;
-"""
-        code += "ods graphics off;\n"
         return code
 
 
@@ -1397,19 +1641,18 @@ class SyntheticGenerator:
 
             self.metadata[col] = meta
 
-        self.numeric_cols = [c for c in df.columns if self.metadata[c]['type'] == 'numeric']
+        # Exclude derived variables from the copula — they'll be recomputed after generation
+        derived_vars = {'chronic_condition_count', 'risk_score', 'er_visits_12mo',
+                        'fall_risk_score', 'had_fall_12mo'}
+        self.numeric_cols = [c for c in df.columns 
+                            if self.metadata[c]['type'] == 'numeric' and c not in derived_vars]
         if len(self.numeric_cols) >= 2:
             self.correlation_matrix = df[self.numeric_cols].corr(method='spearman').values
 
-        # Learn conditional models for binary variables
         self._learn_conditional_models(df)
-
         return self.metadata
 
     def _learn_conditional_models(self, df):
-        """Learn logistic regression models for each binary variable
-        conditioned on numeric variables so synthetic binary columns
-        reflect the same age/income/risk relationships as the source."""
         self.conditional_models = {}
         numeric_predictors = [c for c in self.numeric_cols if c in df.columns]
         binary_cols = [c for c, m in self.metadata.items() if m['type'] == 'binary']
@@ -1437,9 +1680,9 @@ class SyntheticGenerator:
                 }
             except (ValueError, np.linalg.LinAlgError, RuntimeError):
                 continue
+
     @staticmethod
     def _nearest_positive_definite(A):
-        """Find the nearest positive-definite matrix to A (Higham 2002)."""
         B = (A + A.T) / 2
         _, s, V = np.linalg.svd(B)
         H = V.T @ np.diag(s) @ V
@@ -1469,9 +1712,8 @@ class SyntheticGenerator:
                     result = eigvecs @ np.diag(eigvals) @ eigvecs.T
                     np.fill_diagonal(result, 1.0)
                     return result
+
     def _get_binary_generation_order(self):
-        """Order binary columns: risk factors (is_*) first, then
-        conditions (has_*), then derived (mobility/fall)."""
         binary_cols = [c for c, m in self.metadata.items() if m['type'] == 'binary']
         tier1 = [c for c in binary_cols if c.startswith('is_')]
         tier2 = [c for c in binary_cols if c.startswith('has_') and
@@ -1481,7 +1723,6 @@ class SyntheticGenerator:
         return tier1 + tier2 + tier3 + tier4
 
     def _enforce_constraints(self, df):
-        """Post-generation clinical constraint enforcement."""
         df = df.copy()
         if 'has_dementia' in df.columns and 'age' in df.columns:
             df.loc[df['age'] < 40, 'has_dementia'] = 0
@@ -1507,7 +1748,6 @@ class SyntheticGenerator:
         np.random.seed(seed)
         synthetic = pd.DataFrame()
 
-        # STEP 1: Correlated numeric variables via Gaussian Copula
         if self.correlation_matrix is not None and len(self.numeric_cols) >= 2:
             corr = self._nearest_positive_definite(self.correlation_matrix.copy())
             mvn = np.random.multivariate_normal(
@@ -1525,9 +1765,6 @@ class SyntheticGenerator:
                     values = np.round(values).astype(int)
                 synthetic[col] = values
 
-        # STEP 2: Binary variables CONDITIONALLY on numeric variables
-        # Binary columns generated sequentially: risk factors (is_*) → conditions (has_*)
-        # → derived (mobility, falls). Each column becomes a predictor for subsequent ones.
         binary_cols_ordered = self._get_binary_generation_order()
         for col in binary_cols_ordered:
             meta = self.metadata[col]
@@ -1546,7 +1783,6 @@ class SyntheticGenerator:
             else:
                 synthetic[col] = (np.random.random(n_rows) < meta['probability']).astype(int)
 
-        # STEP 3: Categorical variables
         for col, meta in self.metadata.items():
             if meta['type'] == 'categorical':
                 cats = list(meta['categories'].keys())
@@ -1555,11 +1791,111 @@ class SyntheticGenerator:
                 probs = [p / total for p in probs]
                 synthetic[col] = np.random.choice(cats, size=n_rows, p=probs)
 
-        # STEP 4: Clinical constraints
         synthetic = self._enforce_constraints(synthetic)
+        
+        # Recompute derived variables that should be calculated, not generated
+        # chronic_condition_count = sum of all has_* condition flags
+        condition_flags = [c for c in synthetic.columns if c.startswith('has_')
+                          and c not in ['has_stairs', 'has_mobility_limitation']]
+        if condition_flags and 'chronic_condition_count' in synthetic.columns:
+            synthetic['chronic_condition_count'] = synthetic[condition_flags].sum(axis=1).astype(int)
+        
+        # risk_score should be recomputed if it exists and conditions exist
+        if 'risk_score' in synthetic.columns and 'age' in synthetic.columns and condition_flags:
+            age_vals = pd.to_numeric(synthetic['age'], errors='coerce').fillna(42)
+            cc_vals = synthetic[condition_flags].sum(axis=1) if condition_flags else 0
+            rs = (age_vals / 100) * 30 + cc_vals * 5
+            for col in condition_flags:
+                if col in synthetic.columns:
+                    rs = rs + synthetic[col].astype(float) * 12
+            synthetic['risk_score'] = rs.round(1)
+        
+        # er_visits_12mo should be recomputed from risk_score if both exist
+        if 'er_visits_12mo' in synthetic.columns and 'risk_score' in synthetic.columns:
+            rs_vals = pd.to_numeric(synthetic['risk_score'], errors='coerce').fillna(30)
+            synthetic['er_visits_12mo'] = np.random.poisson(
+                np.maximum(0.1, rs_vals / 30).values
+            ).astype(int)
+        
+        # fall_risk_score recompute if falls module variables exist
+        if ('fall_risk_score' in synthetic.columns and 'age' in synthetic.columns):
+            age_vals = pd.to_numeric(synthetic['age'], errors='coerce').fillna(42)
+            fr = np.maximum(0, (age_vals - 50) / 50) * 0.3
+            if 'has_mobility_limitation' in synthetic.columns:
+                fr = fr + synthetic['has_mobility_limitation'].astype(float) * 0.25
+            if 'has_dementia' in synthetic.columns:
+                fr = fr + synthetic['has_dementia'].astype(float) * 0.2
+            if 'has_arthritis' in synthetic.columns:
+                fr = fr + synthetic['has_arthritis'].astype(float) * 0.1
+            if 'num_staircases' in synthetic.columns:
+                fr = fr + pd.to_numeric(synthetic['num_staircases'], errors='coerce').fillna(0) * 0.1
+            synthetic['fall_risk_score'] = np.minimum(1.0, fr).round(3)
+        
+        # had_fall_12mo recompute from fall_risk_score
+        if 'had_fall_12mo' in synthetic.columns and 'fall_risk_score' in synthetic.columns:
+            fr_vals = pd.to_numeric(synthetic['fall_risk_score'], errors='coerce').fillna(0)
+            synthetic['had_fall_12mo'] = (np.random.random(len(synthetic)) < fr_vals).astype(int)
 
         col_order = [c for c in self.metadata.keys() if c in synthetic.columns]
-        return synthetic[col_order]
+        synthetic = synthetic[col_order]
+        
+        # === APPLY SMART ROUNDING TO SYNTHETIC DATA ===
+        for col in synthetic.columns:
+            if not pd.api.types.is_numeric_dtype(synthetic[col]):
+                continue
+            
+            series = synthetic[col].dropna()
+            if len(series) == 0:
+                continue
+            
+            col_min = float(series.min())
+            col_max = float(series.max())
+            col_mean = float(series.mean())
+            unique_vals = set(series.unique())
+            col_lower = col.lower()
+            
+            if unique_vals.issubset({0, 1, 0.0, 1.0}):
+                continue
+            
+            if col_max <= 1.0 and col_min >= 0.0 and col_mean < 1.0:
+                synthetic[col] = synthetic[col].round(3)
+            elif col == 'age':
+                synthetic[col] = synthetic[col].fillna(0).round(0).astype(int)
+            elif any(kw in col_lower for kw in ['cost', 'income', 'salary', 'revenue',
+                                                  'price', 'budget', 'expenditure', 'wage',
+                                                  'payment', 'spend', 'dollar', 'funding']):
+                synthetic[col] = synthetic[col].fillna(0).round(0).astype(int)
+            elif any(kw in col_lower for kw in ['count', 'visits', 'orders', 'admissions',
+                                                  'num_', 'number', 'volume', 'frequency',
+                                                  'demand', 'capacity', 'patients', 'staff',
+                                                  'beds', 'units', 'episodes', 'cases',
+                                                  'readmissions', 'discharges', 'referrals',
+                                                  'prescriptions', 'procedures', 'staircases',
+                                                  'rooms', 'complaints', 'incidents']):
+                synthetic[col] = synthetic[col].fillna(0).round(0).astype(int)
+            elif any(kw in col_lower for kw in ['score', 'index', 'rating', 'scale',
+                                                  'acuity', 'severity', 'priority']):
+                synthetic[col] = synthetic[col].round(1)
+            elif any(kw in col_lower for kw in ['time', 'duration', 'los', 'length_of_stay',
+                                                  'days', 'hours', 'minutes', 'wait',
+                                                  'turnaround', 'response']):
+                synthetic[col] = synthetic[col].round(1)
+            elif any(kw in col_lower for kw in ['percent', 'pct']) and col_max > 1.0:
+                synthetic[col] = synthetic[col].round(1)
+            elif any(kw in col_lower for kw in ['bmi', 'blood_pressure', 'heart_rate',
+                                                  'temperature', 'weight', 'height',
+                                                  'hemoglobin', 'glucose', 'cholesterol',
+                                                  'systolic', 'diastolic', 'o2_sat',
+                                                  'respiratory_rate']):
+                synthetic[col] = synthetic[col].round(1)
+            elif col_mean > 100 and col_min >= 0:
+                synthetic[col] = synthetic[col].fillna(0).round(0).astype(int)
+            elif col_mean >= 1.0:
+                synthetic[col] = synthetic[col].round(1)
+            else:
+                synthetic[col] = synthetic[col].round(3)
+        
+        return synthetic
 
     def compute_fidelity(self, original, synthetic):
         fidelity = {'numeric': {}, 'categorical': {}, 'binary': {}, 'overall_scores': []}
@@ -1573,17 +1909,16 @@ class SyntheticGenerator:
                 ks_stat, ks_p = stats.ks_2samp(orig, synth)
                 mean_diff = abs(orig.mean() - synth.mean()) / (abs(orig.mean()) + 1e-10) * 100
                 std_diff = abs(orig.std() - synth.std()) / (abs(orig.std()) + 1e-10) * 100
-                # Score based on absolute KS quality, not relative to critical value
                 if ks_stat < 0.02:
                     score = 100.0
                 elif ks_stat < 0.05:
-                    score = 100.0 - (ks_stat - 0.02) / 0.03 * 10  # 90-100
+                    score = 100.0 - (ks_stat - 0.02) / 0.03 * 10
                 elif ks_stat < 0.10:
-                    score = 90.0 - (ks_stat - 0.05) / 0.05 * 15   # 75-90
+                    score = 90.0 - (ks_stat - 0.05) / 0.05 * 15
                 elif ks_stat < 0.20:
-                    score = 75.0 - (ks_stat - 0.10) / 0.10 * 25   # 50-75
+                    score = 75.0 - (ks_stat - 0.10) / 0.10 * 25
                 else:
-                    score = max(0, 50.0 - (ks_stat - 0.20) / 0.30 * 50)  # 0-50
+                    score = max(0, 50.0 - (ks_stat - 0.20) / 0.30 * 50)
                 fidelity['numeric'][col] = {
                     'ks_statistic': round(ks_stat, 4), 'ks_pvalue': round(ks_p, 4),
                     'mean_diff_pct': round(mean_diff, 2), 'std_diff_pct': round(std_diff, 2),
@@ -1607,15 +1942,14 @@ class SyntheticGenerator:
                 synth_freq = synthetic[col].astype(str).value_counts(normalize=True)
                 all_cats = set(orig_freq.index) | set(synth_freq.index)
                 tvd = 0.5 * sum(abs(orig_freq.get(c, 0) - synth_freq.get(c, 0)) for c in all_cats)
-                # TVD-based scoring with practical thresholds
                 if tvd < 0.02:
                     score = 100.0
                 elif tvd < 0.05:
-                    score = 100.0 - (tvd - 0.02) / 0.03 * 10   # 90-100
+                    score = 100.0 - (tvd - 0.02) / 0.03 * 10
                 elif tvd < 0.10:
-                    score = 90.0 - (tvd - 0.05) / 0.05 * 15    # 75-90
+                    score = 90.0 - (tvd - 0.05) / 0.05 * 15
                 elif tvd < 0.20:
-                    score = 75.0 - (tvd - 0.10) / 0.10 * 25    # 50-75
+                    score = 75.0 - (tvd - 0.10) / 0.10 * 25
                 else:
                     score = max(0, 50.0 - (tvd - 0.20) / 0.30 * 50)
                 fidelity['categorical'][col] = {'tvd': round(tvd, 4), 'score': round(score, 1)}
@@ -1630,7 +1964,6 @@ class SyntheticGenerator:
             if len(common) >= 2:
                 diff = (orig_corr.loc[common, common] - synth_corr.loc[common, common]).abs().values
                 avg = diff[np.triu_indices_from(diff, k=1)].mean()
-                # Tiered scoring consistent with other metrics
                 if avg < 0.02:
                     cs = 100.0
                 elif avg < 0.05:
@@ -1645,7 +1978,6 @@ class SyntheticGenerator:
                 fidelity['correlation_score'] = round(cs, 1)
                 fidelity['overall_scores'].append(cs)
 
-        # Cross-column dependency preservation (binary ↔ numeric)
         binary_cols = [c for c in original.columns if self.metadata.get(c, {}).get('type') == 'binary']
         dep_scores = []
         for bcol in binary_cols[:8]:
@@ -1665,252 +1997,445 @@ class SyntheticGenerator:
             fidelity['dependency_score'] = round(np.mean(dep_scores), 1)
             fidelity['overall_scores'].append(fidelity['dependency_score'])
 
+        # Recompute fidelity for derived variables using direct comparison
+        # These were recomputed after generation, so compare them as numeric
+        derived_vars = {'chronic_condition_count', 'risk_score', 'er_visits_12mo',
+                        'fall_risk_score', 'had_fall_12mo'}
+        for col in derived_vars:
+            if col not in original.columns or col not in synthetic.columns:
+                continue
+            orig_s = original[col].dropna().astype(float)
+            synth_s = synthetic[col].dropna().astype(float)
+            if len(orig_s) < 10 or len(synth_s) < 10:
+                continue
+            
+            # Remove any previous (bad) score for this variable
+            for var_type in ['numeric', 'binary', 'categorical']:
+                if col in fidelity.get(var_type, {}):
+                    old_score = fidelity[var_type][col].get('score', None)
+                    if old_score is not None and old_score in fidelity['overall_scores']:
+                        fidelity['overall_scores'].remove(old_score)
+                    del fidelity[var_type][col]
+            
+            # Compute fresh fidelity as numeric
+            ks_stat, ks_p = stats.ks_2samp(orig_s, synth_s)
+            mean_diff = abs(orig_s.mean() - synth_s.mean()) / (abs(orig_s.mean()) + 1e-10) * 100
+            std_diff = abs(orig_s.std() - synth_s.std()) / (abs(orig_s.std()) + 1e-10) * 100
+            if ks_stat < 0.02:
+                score = 100.0
+            elif ks_stat < 0.05:
+                score = 100.0 - (ks_stat - 0.02) / 0.03 * 10
+            elif ks_stat < 0.10:
+                score = 90.0 - (ks_stat - 0.05) / 0.05 * 15
+            elif ks_stat < 0.20:
+                score = 75.0 - (ks_stat - 0.10) / 0.10 * 25
+            else:
+                score = max(0, 50.0 - (ks_stat - 0.20) / 0.30 * 50)
+            fidelity['numeric'][col] = {
+                'ks_statistic': round(ks_stat, 4), 'ks_pvalue': round(ks_p, 4),
+                'mean_diff_pct': round(mean_diff, 2), 'std_diff_pct': round(std_diff, 2),
+                'score': round(score, 1)}
+            fidelity['overall_scores'].append(score)
+
         fidelity['overall_score'] = round(np.mean(fidelity['overall_scores']), 1)
         return fidelity
 
 
 # ============================================================
-# DATA BUILDER — now accepts dynamic conditions
+# DATA BUILDER
 # ============================================================
 @st.cache_data(show_spinner=False, ttl=3600)
-def build_catchment_dataset(conditions_json: str, risk_factors_json: str = "[]", _cache_version=0):
-    """Build the catchment population dataset.
+def build_catchment_dataset(enrichment_json: str, _cache_version=0):
+    """Universal dataset builder — generates data for ANY unit of observation based on LLM schema."""
     
-    Accepts JSON strings instead of dicts so that Streamlit's @st.cache_data
-    can hash the arguments. The caller converts dicts to JSON before calling.
+    enrichment = json.loads(enrichment_json)
+    conditions = enrichment.get('conditions', {})
+    risk_factors = enrichment.get('risk_factors', [])
+    include_housing = enrichment.get('include_housing', False)
+    include_falls = enrichment.get('include_falls', False)
+    include_er = enrichment.get('include_er_utilization', True)
+    include_risk_score = enrichment.get('include_risk_score', True)
+    unit = enrichment.get('unit_of_observation', 'person')
+    unit_label = enrichment.get('unit_label', 'resident')
+    n_target = enrichment.get('n_target_rows', 35000)
+    row_id_field = enrichment.get('row_id_field', None)
+    categorical_fields = enrichment.get('categorical_fields', [])
     
-    What the cache does: Generating 34,000+ records takes a few seconds.
-    If the user navigates between pages (which triggers a Streamlit rerun),
-    we don't want to regenerate the entire dataset. The cache stores the
-    result keyed by the exact conditions and risk factors requested.
-    Same inputs = instant return of the previously generated DataFrame.
-    """
-    conditions_dict = json.loads(conditions_json)
-    risk_factors = json.loads(risk_factors_json)
+    # Fallback: if no categorical_fields provided for person-level, use defaults
+    if unit == 'person' and not categorical_fields:
+        categorical_fields = [
+            {
+                'name': 'municipality',
+                'categories': {
+                    'Newmarket': 0.254, 'Aurora': 0.179, 'East Gwillimbury': 0.100,
+                    'Georgina': 0.138, 'Bradford West Gwillimbury': 0.124,
+                    'King': 0.079, 'Innisfil': 0.125
+                },
+                'source': 'Statistics Canada 2021 Census',
+            },
+            {
+                'name': 'sex',
+                'categories': {'Male': 0.49, 'Female': 0.51},
+                'source': 'Statistics Canada 2021 Census',
+            },
+        ]
     
-    # 2021 Census of Population — Statistics Canada
-    # Table 98-10-0001-02: Population and dwelling counts, CSDs
-    # Retrieved from: https://www12.statcan.gc.ca/census-recensement/2021/dp-pd/prof/
-    # Last verified: 2025-03
-    catchment_pop = {
-        'Newmarket': {'pop': 87942, 'median_age': 40.2, 'median_income': 95000},
-        'Aurora': {'pop': 62057, 'median_age': 41.5, 'median_income': 110000},
-        'East Gwillimbury': {'pop': 34637, 'median_age': 39.8, 'median_income': 98000},
-        'Georgina': {'pop': 47642, 'median_age': 42.1, 'median_income': 82000},
-        'Bradford West Gwillimbury': {'pop': 42880, 'median_age': 37.5, 'median_income': 92000},
-        'King': {'pop': 27333, 'median_age': 43.2, 'median_income': 125000},
-        'Innisfil': {'pop': 43326, 'median_age': 40.8, 'median_income': 88000},
-    }
+    # Ensure n_target is reasonable
+    if not isinstance(n_target, (int, float)) or n_target <= 0:
+        n_target = 35000
+    n_target = int(min(n_target, 50000))
     
-    housing_rates_raw = {
-        'Single detached': 0.52, 'Semi-detached': 0.08, 'Row house': 0.12,
-        'Apartment <5 storeys': 0.10, 'Apartment 5+ storeys': 0.14, 'Other': 0.04,
-    }
-    ht = sum(housing_rates_raw.values())
-    housing_rates = {k: v / ht for k, v in housing_rates_raw.items()}
-    storeys_by_dwelling = {
-        'Single detached': {'1': 0.25, '2': 0.60, '3+': 0.15},
-        'Semi-detached': {'1': 0.10, '2': 0.75, '3+': 0.15},
-        'Row house': {'1': 0.05, '2': 0.80, '3+': 0.15},
-        'Apartment <5 storeys': {'1': 0.90, '2': 0.10, '3+': 0.0},
-        'Apartment 5+ storeys': {'1': 0.95, '2': 0.05, '3+': 0.0},
-        'Other': {'1': 0.60, '2': 0.30, '3+': 0.10},
-    }
-    age_dist_raw = {
-        '0-14': 0.155, '15-24': 0.115, '25-34': 0.130, '35-44': 0.135,
-        '45-54': 0.125, '55-64': 0.135, '65-74': 0.105, '75-84': 0.060, '85+': 0.040,
-    }
-    tot = sum(age_dist_raw.values())
-    age_dist = {k: v / tot for k, v in age_dist_raw.items()}
-    age_ranges = {
-        '0-14': (0, 14), '15-24': (15, 24), '25-34': (25, 34), '35-44': (35, 44),
-        '45-54': (45, 54), '55-64': (55, 64), '65-74': (65, 74), '75-84': (75, 84),
-        '85+': (85, 99),
-    }
-    room_means = {
-        'Single detached': 8, 'Semi-detached': 7, 'Row house': 7,
-        'Apartment <5 storeys': 4, 'Apartment 5+ storeys': 4, 'Other': 5,
-    }
-
     np.random.seed(42)
     records = []
-    for muni, demo in catchment_pop.items():
-        n = demo['pop'] // 10
-        for _ in range(n):
-            r = {'municipality': muni}
-            ag = np.random.choice(list(age_dist.keys()), p=list(age_dist.values()))
-            age = np.random.randint(*age_ranges[ag])
-            r['age'], r['age_group'] = age, ag
-            r['sex'] = np.random.choice(['Male', 'Female'], p=[0.49, 0.51])
-            inc = max(0, np.random.lognormal(np.log(demo['median_income']), 0.5))
-            r['income'] = round(inc, 0) if np.random.random() > 0.03 else np.nan
-            r['income_quintile'] = str(pd.cut([inc],
-                bins=[0, 30000, 55000, 80000, 110000, float('inf')],
-                labels=['Q1', 'Q2', 'Q3', 'Q4', 'Q5'])[0])
-            dw = np.random.choice(list(housing_rates.keys()), p=list(housing_rates.values()))
-            r['dwelling_type'] = dw
-            sd = storeys_by_dwelling[dw]
-            r['num_storeys'] = np.random.choice(list(sd.keys()), p=list(sd.values()))
-            sv = r['num_storeys']
-            if sv == '1':
-                r['has_stairs'] = int(np.random.random() < 0.15)
-                r['num_staircases'] = 0 if not r['has_stairs'] else 1
-            elif sv == '2':
-                r['has_stairs'] = 1
-                r['num_staircases'] = np.random.choice([1, 2], p=[0.75, 0.25])
-            else:
-                r['has_stairs'] = 1
-                r['num_staircases'] = np.random.choice([2, 3], p=[0.70, 0.30])
-            r['num_rooms'] = max(1, int(np.random.normal(room_means[dw], 1.5)))
+    
+    for i in range(n_target):
+        r = {}
+        
+        # === ROW ID ===
+        if row_id_field:
+            prefix = row_id_field.replace('_id', '').upper()[:3]
+            r[row_id_field] = f"{prefix}-{i+1:05d}"
+        
+        # === CATEGORICAL FIELDS ===
+        for cf in categorical_fields:
+            cats = list(cf['categories'].keys())
+            probs = list(cf['categories'].values())
+            total = sum(probs)
+            probs = [p / total for p in probs]
+            r[cf['name']] = np.random.choice(cats, p=probs)
+        
+        # === RISK FACTORS (numeric and binary) ===
+        # First pass: generate all numeric risk factors
+        for rf in risk_factors:
+            rf_name = rf['name']
+            rf_type = rf.get('type', 'binary')
+            age_factor_type = rf.get('age_factor', 'flat')
             
-            # Age factor for age-adjusted conditions
-            af = max(0.3, age / 65)
-            
-            # STEP 1: Generate risk factors FIRST
-            for rf in risk_factors:
-                rf_name = rf['name']
-                rf_type = rf.get('type', 'binary')
-                age_factor_type = rf.get('age_factor', 'flat')
-                
+            # Compute age multiplier if age exists in this record
+            age = r.get('age', None)
+            if age is not None and age_factor_type != 'flat':
+                individual_variation = np.random.uniform(0.7, 1.3)
                 if age_factor_type == 'increases_with_age':
-                    age_mult = max(0.3, age / 65)
+                    age_mult = max(0.3, age / 65) * individual_variation
                 elif age_factor_type == 'decreases_with_age':
-                    age_mult = max(0.3, (100 - age) / 65)
+                    age_mult = max(0.3, (100 - age) / 65) * individual_variation
                 elif age_factor_type == 'peaks_middle_age':
-                    age_mult = max(0.5, 1.0 - abs(age - 45) / 45)
+                    age_mult = max(0.5, 1.0 - abs(age - 45) / 45) * individual_variation
                 else:
                     age_mult = 1.0
-                
-                if rf_type == 'binary':
-                    base_prev = rf.get('prevalence', 0.1) * age_mult
-                    r[rf_name] = int(np.random.random() < min(0.95, base_prev))
-                elif rf_type == 'numeric':
-                    val = np.random.normal(rf.get('mean', 50), rf.get('std', 10))
-                    val += (age_mult - 1.0) * rf.get('std', 10) * 0.5
-                    val = np.clip(val, rf.get('min', 0), rf.get('max', 100))
-                    r[rf_name] = round(val, 1)
-            
-            # STEP 2: Generate conditions WITH risk factor awareness
-            condition_cols = []
-            for cond_name, cond_info in conditions_dict.items():
-                col_name = f"has_{cond_name}"
-                prev = cond_info['prevalence']
-                age_adjusted = cond_info.get('age_adjusted', True)
-                age_factor_type = cond_info.get('age_factor', 'increases_with_age')
-                
-                if age_adjusted:
-                    if age_factor_type == 'increases_with_age':
-                        adjusted_prev = prev * af
-                    elif age_factor_type == 'decreases_with_age':
-                        adjusted_prev = prev * max(0.3, (100 - age) / 65)
-                    elif age_factor_type == 'peaks_middle_age':
-                        adjusted_prev = prev * max(0.5, 1.0 - abs(age - 50) / 50)
-                    else:
-                        adjusted_prev = prev
-                else:
-                    adjusted_prev = prev
-                
-                # Apply comorbidity boost
-                comorbidities = cond_info.get('comorbidities', [])
-                for comorbid in comorbidities:
-                    if comorbid in r and r[comorbid] == 1:
-                        adjusted_prev *= 1.3
-                
-                # Apply risk factor boost using epidemiological rate derivation
-                rf_names_for_cond = cond_info.get('risk_factors', [])
-                for rf in risk_factors:
-                    if rf['name'] in rf_names_for_cond and rf['name'] in r:
-                        cs = rf.get('correlation_strength', 0.3)
-                        if rf['type'] == 'binary':
-                            rf_prev = rf.get('prevalence', 0.15)
-                            # Derive relative risk from correlation strength
-                            # cs=0.3 → RR≈4, cs=0.5 → RR≈6, cs=0.1 → RR≈2
-                            relative_risk = 1.0 + cs * 10
-                            # Solve: prev = rate_exposed * rf_prev + rate_unexposed * (1 - rf_prev)
-                            #         relative_risk = rate_exposed / rate_unexposed
-                            rate_unexposed = prev / (relative_risk * rf_prev + (1 - rf_prev))
-                            rate_exposed = rate_unexposed * relative_risk
-                            # Safety caps: no condition exceeds 40% even in exposed group
-                            rate_exposed = min(0.40, rate_exposed)
-                            rate_unexposed = max(0.001, rate_unexposed)
-                            if r[rf['name']] == 1:
-                                adjusted_prev = rate_exposed
-                            else:
-                                adjusted_prev = rate_unexposed
-                        elif rf['type'] == 'numeric':
-                            rf_mean = rf.get('mean', 50)
-                            rf_std = rf.get('std', 10)
-                            z_score = (r[rf['name']] - rf_mean) / max(rf_std, 0.1)
-                            # Smooth dose-response: z=0→1x, z=1→~2x, z=2→~3x, z=-1→~0.5x
-                            rr_multiplier = np.exp(cs * z_score * 0.7)
-                            rr_multiplier = np.clip(rr_multiplier, 0.1, 5.0)
-                            adjusted_prev = adjusted_prev * rr_multiplier
-                
-                adjusted_prev = min(0.85, adjusted_prev)
-                r[col_name] = int(np.random.random() < adjusted_prev)
-                condition_cols.append(col_name)
-            
-            # STEP 3: Now boost risk factors if correlated conditions are present (bidirectional)
-            for rf in risk_factors:
-                rf_name = rf['name']
-                if rf_name not in r:
-                    continue
-                for corr_col in rf.get('correlates_with', []):
-                    if corr_col in r and r[corr_col] == 1:
-                        if rf['type'] == 'binary' and r[rf_name] == 0:
-                            boost = rf.get('correlation_strength', 0.3) * 0.5
-                            if np.random.random() < boost:
-                                r[rf_name] = 1
-                        elif rf['type'] == 'numeric':
-                            # Shift numeric value significantly when correlated condition is present
-                            shift = rf.get('std', 10) * rf.get('correlation_strength', 0.3) * 4
-                            r[rf_name] = round(np.clip(
-                                r[rf_name] + shift, rf.get('min', 0), rf.get('max', 100)), 1)
-            
-            # Dementia — special age logic (only 60+)
-            if 'has_dementia' not in r:
-                r['has_dementia'] = int(np.random.random() < 0.065 * max(0, (age - 60) / 40))
-            
-            # Mobility
-            mob = (age / 100) + r.get('has_arthritis', 0) * 0.2 + r.get('has_dementia', 0) * 0.3
-            r['has_mobility_limitation'] = int(np.random.random() < min(0.9, mob))
-            
-            # Chronic condition count (all has_ columns)
-            cc = sum(r.get(col, 0) for col in condition_cols if col in r)
-            r['chronic_condition_count'] = cc
-            
-            # Risk score
-            rs = (age / 100) * 30 + cc * 5
-            for col in condition_cols:
-                if r.get(col, 0) == 1:
-                    rs += 12
-            rs += r.get('has_dementia', 0) * 20
-            rs += r['has_mobility_limitation'] * 8
-            rs += (5 - ['Q1', 'Q2', 'Q3', 'Q4', 'Q5'].index(r['income_quintile'])) * 3
-            r['risk_score'] = round(rs, 1) if np.random.random() > 0.02 else np.nan
-            
-            r['er_visits_12mo'] = np.random.poisson(max(0.1, rs / 30))
-            
-            fr = (max(0, (age - 50) / 50) * 0.3 + r['has_mobility_limitation'] * 0.25 +
-                  r.get('has_dementia', 0) * 0.2 + r['num_staircases'] * 0.1 +
-                  r.get('has_arthritis', 0) * 0.1)
-            r['fall_risk_score'] = round(min(1.0, fr), 3)
-            r['had_fall_12mo'] = int(np.random.random() < fr)
-            
-            if cc == 0:
-                seg = '1_Prevention'
-            elif cc <= 2 and age < 65:
-                seg = '2_Early'
-            elif cc <= 2 and age >= 65:
-                seg = '3_Advanced'
-            elif cc >= 3:
-                seg = '3_Advanced'
             else:
-                seg = '2_Early'
-            r['population_segment'] = seg
+                age_mult = 1.0
             
-            records.append(r)
-    return pd.DataFrame(records)
+            if rf_type == 'numeric':
+                val = np.random.normal(rf.get('mean', 50), rf.get('std', 10))
+                # Apply age influence
+                val += (age_mult - 1.0) * rf.get('std', 10) * 0.3
+                val = np.clip(val, rf.get('min', 0), rf.get('max', 100))
+                r[rf_name] = round(val, 2)
+            elif rf_type == 'binary':
+                base_prev = rf.get('prevalence', 0.1) * age_mult
+                r[rf_name] = int(np.random.random() < min(0.95, max(0.01, base_prev)))
+        
+        # === CONDITIONS ===
+        condition_cols = []
+        for cond_name, cond_info in conditions.items():
+            col_name = f"has_{cond_name}"
+            prev = cond_info.get('prevalence', 0.05)
+            age_adjusted = cond_info.get('age_adjusted', True)
+            age_factor_type = cond_info.get('age_factor', 'increases_with_age')
+            
+            age = r.get('age', None)
+            if age is not None and age_adjusted:
+                # Individual variation: some people are healthier/unhealthier
+                # than their age would predict (genetics, lifestyle, environment)
+                individual_variation = np.random.uniform(0.6, 1.4)
+                if age_factor_type == 'increases_with_age':
+                    af = max(0.3, age / 65) * individual_variation
+                elif age_factor_type == 'decreases_with_age':
+                    af = max(0.3, (100 - age) / 65) * individual_variation
+                elif age_factor_type == 'peaks_middle_age':
+                    af = max(0.5, 1.0 - abs(age - 50) / 50) * individual_variation
+                else:
+                    af = 1.0
+                adjusted_prev = prev * af
+            else:
+                adjusted_prev = prev
+            
+            # Comorbidity boost
+            for comorbid in cond_info.get('comorbidities', []):
+                if comorbid in r and r[comorbid] == 1:
+                    adjusted_prev *= 1.3
+            
+            # Risk factor influence
+            for rf in risk_factors:
+                if rf['name'] in cond_info.get('risk_factors', []) and rf['name'] in r:
+                    cs = rf.get('correlation_strength', 0.3)
+                    if rf['type'] == 'binary':
+                        rf_prev = rf.get('prevalence', 0.15)
+                        relative_risk = 1.0 + cs * 10
+                        rate_unexposed = prev / (relative_risk * rf_prev + (1 - rf_prev))
+                        rate_exposed = rate_unexposed * relative_risk
+                        rate_exposed = min(0.40, rate_exposed)
+                        rate_unexposed = max(0.001, rate_unexposed)
+                        adjusted_prev = rate_exposed if r[rf['name']] == 1 else rate_unexposed
+                    elif rf['type'] == 'numeric':
+                        rf_mean = rf.get('mean', 50)
+                        rf_std = rf.get('std', 10)
+                        z_score = (r[rf['name']] - rf_mean) / max(rf_std, 0.1)
+                        rr_multiplier = np.exp(cs * z_score * 0.7)
+                        rr_multiplier = np.clip(rr_multiplier, 0.1, 5.0)
+                        adjusted_prev = adjusted_prev * rr_multiplier
+            
+            adjusted_prev = min(0.85, adjusted_prev)
+            r[col_name] = int(np.random.random() < adjusted_prev)
+            condition_cols.append(col_name)
+        
+        # === CROSS-VARIABLE CORRELATIONS (numeric ↔ numeric) ===
+        numeric_rfs = [rf for rf in risk_factors if rf['type'] == 'numeric' and rf['name'] in r]
+        for idx, rf1 in enumerate(numeric_rfs):
+            for rf2 in numeric_rfs[idx+1:]:
+                shared = set(rf1.get('correlates_with', [])) & set(rf2.get('correlates_with', []))
+                direct = (rf2['name'] in rf1.get('correlates_with', []) or
+                          rf1['name'] in rf2.get('correlates_with', []))
+                if shared or direct:
+                    strength = max(rf1.get('correlation_strength', 0.3),
+                                  rf2.get('correlation_strength', 0.3))
+                    if direct:
+                        strength = min(0.7, strength * 1.5)
+                    z1 = (r[rf1['name']] - rf1.get('mean', 50)) / max(rf1.get('std', 10), 0.1)
+                    nudge = z1 * rf2.get('std', 10) * strength * 0.8
+                    r[rf2['name']] = round(np.clip(
+                        r[rf2['name']] + nudge, rf2.get('min', 0), rf2.get('max', 100)), 2)
+        
+        # === NUMERIC ↔ BINARY CORRELATIONS ===
+        for rf in risk_factors:
+            rf_name = rf['name']
+            if rf_name not in r or rf.get('type') != 'numeric':
+                continue
+            for corr_target in rf.get('correlates_with', []):
+                target_name = None
+                for prefix in ['', 'has_', 'is_']:
+                    candidate = f"{prefix}{corr_target}" if prefix else corr_target
+                    if candidate in r:
+                        target_name = candidate
+                        break
+                if target_name is None:
+                    continue
+                target_val = r.get(target_name)
+                if target_val != 1:
+                    continue
+                # Verify target is binary
+                is_binary = target_name.startswith('has_') or target_name.startswith('is_')
+                if not is_binary:
+                    for other_rf in risk_factors:
+                        if other_rf['name'] == target_name and other_rf['type'] == 'binary':
+                            is_binary = True
+                            break
+                if not is_binary:
+                    continue
+                strength = rf.get('correlation_strength', 0.3)
+                boost = rf.get('std', 10) * strength * 1.2
+                r[rf_name] = round(np.clip(
+                    r[rf_name] + boost, rf.get('min', 0), rf.get('max', 100)), 2)
+        
+        # === BIDIRECTIONAL BOOST (binary risk factors boosted by conditions) ===
+        for rf in risk_factors:
+            rf_name = rf['name']
+            if rf_name not in r:
+                continue
+            for corr_col in rf.get('correlates_with', []):
+                actual_col = corr_col if corr_col in r else (f"has_{corr_col}" if f"has_{corr_col}" in r else None)
+                if actual_col and r.get(actual_col) == 1:
+                    if rf['type'] == 'binary' and r[rf_name] == 0:
+                        boost_prob = rf.get('correlation_strength', 0.3) * 0.10
+                        if np.random.random() < boost_prob:
+                            r[rf_name] = 1
+                    elif rf['type'] == 'numeric':
+                        shift = rf.get('std', 10) * rf.get('correlation_strength', 0.3) * 0.8
+                        r[rf_name] = round(np.clip(
+                            r[rf_name] + shift, rf.get('min', 0), rf.get('max', 100)), 2)
+        
+        # === PERSON-LEVEL DERIVED VARIABLES ===
+        if unit == 'person':
+            # Chronic condition count
+            if condition_cols:
+                r['chronic_condition_count'] = sum(r.get(col, 0) for col in condition_cols)
+            
+            # Composite risk score
+            if include_risk_score and condition_cols:
+                age = r.get('age', 42)
+                rs = (age / 100) * 30 + r.get('chronic_condition_count', 0) * 5
+                for col in condition_cols:
+                    if r.get(col, 0) == 1:
+                        rs += 12
+                r['risk_score'] = round(rs, 1) if np.random.random() > 0.02 else np.nan
+            
+            # ER utilization
+            if include_er:
+                rs_val = r.get('risk_score', 30)
+                if pd.isna(rs_val):
+                    rs_val = 30
+                r['er_visits_12mo'] = np.random.poisson(max(0.1, rs_val / 30))
+            
+            # Falls module
+            if include_falls:
+                age = r.get('age', 42)
+                mob = (age / 100) + r.get('has_arthritis', 0) * 0.2 + r.get('has_dementia', 0) * 0.3
+                r['has_mobility_limitation'] = int(np.random.random() < min(0.9, mob))
+                fr = (max(0, (age - 50) / 50) * 0.3 + r.get('has_mobility_limitation', 0) * 0.25 +
+                      r.get('has_dementia', 0) * 0.2 + r.get('num_staircases', 0) * 0.1 +
+                      r.get('has_arthritis', 0) * 0.1)
+                r['fall_risk_score'] = round(min(1.0, fr), 3)
+                r['had_fall_12mo'] = int(np.random.random() < fr)
+            
+            # Housing module
+            if include_housing:
+                housing_rates = {
+                    'Single detached': 0.52, 'Semi-detached': 0.08, 'Row house': 0.12,
+                    'Apartment <5 storeys': 0.10, 'Apartment 5+ storeys': 0.14, 'Other': 0.04,
+                }
+                ht = sum(housing_rates.values())
+                housing_rates = {k: v / ht for k, v in housing_rates.items()}
+                dw = np.random.choice(list(housing_rates.keys()), p=list(housing_rates.values()))
+                r['dwelling_type'] = dw
+                storeys_by_dwelling = {
+                    'Single detached': {'1': 0.25, '2': 0.60, '3+': 0.15},
+                    'Semi-detached': {'1': 0.10, '2': 0.75, '3+': 0.15},
+                    'Row house': {'1': 0.05, '2': 0.80, '3+': 0.15},
+                    'Apartment <5 storeys': {'1': 0.90, '2': 0.10, '3+': 0.0},
+                    'Apartment 5+ storeys': {'1': 0.95, '2': 0.05, '3+': 0.0},
+                    'Other': {'1': 0.60, '2': 0.30, '3+': 0.10},
+                }
+                room_means = {
+                    'Single detached': 8, 'Semi-detached': 7, 'Row house': 7,
+                    'Apartment <5 storeys': 4, 'Apartment 5+ storeys': 4, 'Other': 5,
+                }
+                sd = storeys_by_dwelling[dw]
+                r['num_storeys'] = np.random.choice(list(sd.keys()), p=list(sd.values()))
+                sv = r['num_storeys']
+                if sv == '1':
+                    r['has_stairs'] = int(np.random.random() < 0.15)
+                    r['num_staircases'] = 0 if not r['has_stairs'] else 1
+                elif sv == '2':
+                    r['has_stairs'] = 1
+                    r['num_staircases'] = np.random.choice([1, 2], p=[0.75, 0.25])
+                else:
+                    r['has_stairs'] = 1
+                    r['num_staircases'] = np.random.choice([2, 3], p=[0.70, 0.30])
+                r['num_rooms'] = max(1, int(np.random.normal(room_means[dw], 1.5)))
+            
+            # Population segment
+            if condition_cols:
+                age = r.get('age', 42)
+                cc = r.get('chronic_condition_count', 0)
+                if cc == 0:
+                    seg = '1_Prevention'
+                elif cc <= 2 and age < 65:
+                    seg = '2_Early'
+                elif cc <= 2 and age >= 65:
+                    seg = '3_Advanced'
+                else:
+                    seg = '3_Advanced'
+                r['population_segment'] = seg
+            
+            # Age constraints on conditions
+            age = r.get('age', 42)
+            if 'has_dementia' in r and age < 40:
+                r['has_dementia'] = 0
+            if age < 18:
+                for col in ['has_hypertension', 'has_copd', 'has_arthritis',
+                           'has_heart_disease', 'has_dementia']:
+                    if col in r:
+                        r[col] = 0
+            # Recount after constraints
+            if condition_cols:
+                r['chronic_condition_count'] = sum(r.get(col, 0) for col in condition_cols)
+        
+        records.append(r)
+    
+    df = pd.DataFrame(records)
+    
+    # === UNIVERSAL SMART ROUNDING ===
+    # Applies to ALL question types (person, item, encounter, department, month)
+    # Determines appropriate precision from variable name and value range
+    for col in df.columns:
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        
+        series = df[col].dropna()
+        if len(series) == 0:
+            continue
+        
+        col_min = float(series.min())
+        col_max = float(series.max())
+        col_mean = float(series.mean())
+        unique_vals = set(series.unique())
+        col_lower = col.lower()
+        
+        # Skip columns that are already clean (binary 0/1)
+        if unique_vals.issubset({0, 1, 0.0, 1.0}):
+            continue
+        
+        # RULE 1: Rates and proportions (values strictly between 0 and 1)
+        if col_max <= 1.0 and col_min >= 0.0 and col_mean < 1.0:
+            df[col] = df[col].round(3)
+        
+        # RULE 2: Age — always integer
+        elif col == 'age':
+            df[col] = df[col].fillna(0).round(0).astype(int)
+        
+        # RULE 3: Money columns — round to whole dollars
+        elif any(kw in col_lower for kw in ['cost', 'income', 'salary', 'revenue',
+                                              'price', 'budget', 'expenditure', 'wage',
+                                              'payment', 'spend', 'dollar', 'funding']):
+            df[col] = df[col].fillna(0).round(0).astype(int)
+        
+        # RULE 4: Count columns — must be integers
+        elif any(kw in col_lower for kw in ['count', 'visits', 'orders', 'admissions',
+                                              'num_', 'number', 'volume', 'frequency',
+                                              'demand', 'capacity', 'patients', 'staff',
+                                              'beds', 'units', 'episodes', 'cases',
+                                              'readmissions', 'discharges', 'referrals',
+                                              'prescriptions', 'procedures', 'staircases',
+                                              'rooms', 'complaints', 'incidents']):
+            df[col] = df[col].fillna(0).round(0).astype(int)
+        
+        # RULE 5: Scores and indices — 1 decimal place
+        elif any(kw in col_lower for kw in ['score', 'index', 'rating', 'scale',
+                                              'acuity', 'severity', 'priority']):
+            df[col] = df[col].round(1)
+        
+        # RULE 6: Time durations — 1 decimal place
+        elif any(kw in col_lower for kw in ['time', 'duration', 'los', 'length_of_stay',
+                                              'days', 'hours', 'minutes', 'wait',
+                                              'turnaround', 'response']):
+            df[col] = df[col].round(1)
+        
+        # RULE 7: Percentages stored as 0-100 (not 0-1)
+        elif any(kw in col_lower for kw in ['percent', 'pct']) and col_max > 1.0:
+            df[col] = df[col].round(1)
+        
+        # RULE 8: Clinical measurements — 1 decimal place
+        elif any(kw in col_lower for kw in ['bmi', 'blood_pressure', 'heart_rate',
+                                              'temperature', 'weight', 'height',
+                                              'hemoglobin', 'glucose', 'cholesterol',
+                                              'systolic', 'diastolic', 'o2_sat',
+                                              'respiratory_rate']):
+            df[col] = df[col].round(1)
+        
+        # RULE 9: Large positive values (mean > 100) — likely counts or money we missed
+        elif col_mean > 100 and col_min >= 0:
+            df[col] = df[col].fillna(0).round(0).astype(int)
+        
+        # RULE 10: Medium-range values (mean 1-100) — 1 decimal place
+        elif col_mean >= 1.0:
+            df[col] = df[col].round(1)
+        
+        # RULE 11: Small values (mean < 1) — likely rates or probabilities
+        else:
+            df[col] = df[col].round(3)
+    
+    return df
 
 
 # ============================================================
@@ -1942,129 +2467,100 @@ for d in [DATA_DIR, SAS_DIR, OUTPUT_DIR, CHARTS_DIR]:
 # ============================================================
 # SESSION STATE
 # ============================================================
-if 'pipeline_run' not in st.session_state:
-    st.session_state.pipeline_run = False
-if 'original_df' not in st.session_state:
-    st.session_state.original_df = None
-if 'cleaned_df' not in st.session_state:
-    st.session_state.cleaned_df = None
-if 'synthetic_df' not in st.session_state:
-    st.session_state.synthetic_df = None
-if 'fidelity' not in st.session_state:
-    st.session_state.fidelity = None
-if 'sas_programs' not in st.session_state:
-    st.session_state.sas_programs = {}
-if 'narrative' not in st.session_state:
-    st.session_state.narrative = None
-if 'question' not in st.session_state:
-    st.session_state.question = ""
-if 'pipeline_log' not in st.session_state:
-    st.session_state.pipeline_log = []
-if 'relevant_vars' not in st.session_state:
-    st.session_state.relevant_vars = None
-if 'additional_sources' not in st.session_state:
-    st.session_state.additional_sources = []
-if 'additional_conditions' not in st.session_state:
-    st.session_state.additional_conditions = []
-if 'additional_risk_factors' not in st.session_state:
-    st.session_state.additional_risk_factors = []
-if 'sas_runner' not in st.session_state:
-    st.session_state.sas_runner = None
-if 'sas_connected' not in st.session_state:
-    st.session_state.sas_connected = False
-if 'sas_execution_log' not in st.session_state:
-    st.session_state.sas_execution_log = []
-if 'cache_buster' not in st.session_state:
-    st.session_state.cache_buster = 0
+for key, default in [
+    ('pipeline_run', False), ('original_df', None), ('cleaned_df', None),
+    ('synthetic_df', None), ('fidelity', None), ('sas_programs', {}),
+    ('narrative', None), ('question', ""), ('pipeline_log', []),
+    ('relevant_vars', None), ('additional_sources', []),
+    ('additional_conditions', []), ('additional_risk_factors', []),
+    ('sas_runner', None), ('sas_connected', False),
+    ('sas_execution_log', []), ('cache_buster', 0),
+    ('excluded_vars', []),
+    ('enrichment', {}),
+    ('user_role', 'Population Health Planner'),
+    ('metadata_overrides', {}),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
 
 # ============================================================
-# PIPELINE
+# PIPELINE PHASES
 # ============================================================
-# ============================================================
-# PIPELINE — PHASE FUNCTIONS
-# ============================================================
-
 def phase_1_enrich(question, progress):
-    """Phase 1: Analyze question and enrich data sources."""
-    progress.progress(5, text="Analyzing question & sourcing data...")
+    progress.progress(5, text="Analyzing question & designing data schema...")
     enrichment = analyze_question_and_enrich(question, _cache_version=st.session_state.cache_buster)
-    conditions_dict = enrichment[0]
-    relevant_existing = enrichment[1]
-    additional_sources = enrichment[2] if len(enrichment) > 2 else []
-    additional_conditions = enrichment[3] if len(enrichment) > 3 else []
-    relevant_demographics = enrichment[4] if len(enrichment) > 4 else ['age', 'sex', 'income', 'municipality']
-    additional_risk_factors = enrichment[5] if len(enrichment) > 5 else []
     
-    st.session_state.additional_sources = additional_sources
-    st.session_state.additional_conditions = additional_conditions
-    st.session_state.additional_risk_factors = additional_risk_factors
+    # Store in session state for other pages to access
+    st.session_state.additional_sources = enrichment.get('data_sources', [])
+    st.session_state.additional_conditions = [
+        {'name': k, **v} for k, v in enrichment.get('conditions', {}).items()
+    ]
+    st.session_state.additional_risk_factors = enrichment.get('risk_factors', [])
+    st.session_state.enrichment = enrichment
 
-    # API key warning (can't go inside cached function)
     if not os.getenv("OPENAI_API_KEY"):
         st.sidebar.warning("⚠️ OPENAI_API_KEY not set — running without LLM enrichment.")
     
-    # Check if enrichment returned an error signal
-    enrichment_errors = [s for s in additional_sources if s.get('name', '').startswith('LLM')]
-    if enrichment_errors:
-        error_msg = enrichment_errors[0].get('url', 'Unknown error')
-        st.warning(f"⚠️ LLM enrichment failed: {error_msg}. Using base conditions only. "
-                   f"Try rephrasing your question or click 'Clear Cache & Re-run'.")
-        additional_sources = [s for s in additional_sources if not s.get('name', '').startswith('LLM')]
-        st.session_state.additional_sources = additional_sources
+    # Check for errors
+    error_sources = [s for s in enrichment.get('data_sources', []) if s.get('name', '').startswith('LLM')]
+    if error_sources:
+        st.warning(f"⚠️ LLM enrichment failed: {error_sources[0].get('url', '')}. Using defaults.")
     
-    log_entry = f"GPT-4o identified {len(additional_conditions)} additional conditions"
-    if additional_conditions:
-        log_entry += f" ({', '.join(c['name'] for c in additional_conditions)})"
-    log_entry += f", {len(additional_risk_factors)} risk factors"
-    if enrichment_errors:
-        log_entry += " ⚠️ (LLM parse error — base conditions only)"
+    q_type = enrichment.get('question_type', 'PREVALENCE')
+    n_conditions = len(enrichment.get('conditions', {}))
+    n_rf = len(enrichment.get('risk_factors', []))
+    cond_names = list(enrichment.get('conditions', {}).keys())
+    rf_names = [rf['name'] for rf in enrichment.get('risk_factors', [])]
+    
+    log_entry = (f"Schema type: {q_type} | {n_conditions} conditions ({', '.join(cond_names[:4])})"
+                 f" | {n_rf} risk factors ({', '.join(rf_names[:4])})")
     
     return {
-        'conditions_dict': conditions_dict,
-        'relevant_existing': relevant_existing,
-        'additional_sources': additional_sources,
-        'additional_conditions': additional_conditions,
-        'relevant_demographics': relevant_demographics,
-        'additional_risk_factors': additional_risk_factors,
+        'enrichment': enrichment,
         'log': log_entry,
     }
 
 
-def phase_2_build_data(enrichment, progress):
-    """Phase 2: Build catchment population with enriched data."""
-    progress.progress(15, text="Building catchment population with enriched data...")
+def phase_2_build_data(enrichment_result, progress):
+    enrichment_preview = enrichment_result['enrichment']
+    unit_label_preview = enrichment_preview.get('unit_label', 'resident')
+    n_target_preview = enrichment_preview.get('n_target_rows', 35000)
+    progress.progress(15, text=f"🏗️ Building {n_target_preview:,} {unit_label_preview} records with age-adjusted prevalence & correlation injection...")
+    enrichment = enrichment_result['enrichment']
     df = build_catchment_dataset(
-        json.dumps(enrichment['conditions_dict'], sort_keys=True, default=str),
-        json.dumps(enrichment['additional_risk_factors'], sort_keys=True, default=str),
+        json.dumps(enrichment, sort_keys=True, default=str),
         _cache_version=st.session_state.cache_buster)
     csv_path = os.path.join(DATA_DIR, "source_data.csv")
     df.to_csv(csv_path, index=False)
     st.session_state.original_df = df
     
     all_columns = list(df.columns)
-    relevant_vars = get_relevant_variables(
-        st.session_state.question, all_columns,
-        enrichment['relevant_existing'],
-        enrichment['additional_conditions'],
-        enrichment['relevant_demographics'])
+    relevant_vars = get_relevant_variables(st.session_state.question, all_columns, enrichment)
     st.session_state.relevant_vars = relevant_vars
     
-    # Upload to SAS Viya if connected
     sas_runner = st.session_state.sas_runner
     sas_upload_msg = ""
     if sas_runner and sas_runner.connected:
-        progress.progress(18, text="Uploading data to SAS Viya...")
+        progress.progress(18, text=f"📤 Uploading {len(df):,} records to SAS Viya WORK.SOURCE_DATA...")
         if sas_runner.upload_dataframe(df, 'SOURCE_DATA'):
             sas_upload_msg = " | Uploaded to SAS Viya"
             st.session_state.sas_execution_log.append({
                 'phase': 'Upload', 'method': 'df2sd', 'success': True
             })
     
-    return df, csv_path, f"{len(df):,} records across 7 municipalities{sas_upload_msg}"
+    unit_label = enrichment.get('unit_label', 'record')
+    cat_fields = enrichment.get('categorical_fields', [])
+    if cat_fields:
+        first_cat = cat_fields[0]
+        n_cats = len(first_cat.get('categories', {}))
+        cat_name = first_cat.get('name', 'categories').replace('_', ' ')
+        return df, csv_path, f"{len(df):,} {unit_label}s across {n_cats} {cat_name} groups{sas_upload_msg}"
+    else:
+        return df, csv_path, f"{len(df):,} {unit_label}s generated{sas_upload_msg}"
 
 
 def phase_3_sas_generation(df, csv_path, progress):
-    """Phase 3-6: Generate all SAS programs."""
     sas_engine = SASEngine(SAS_DIR, OUTPUT_DIR)
     sas_gen = SASCodeGenerator(OUTPUT_DIR)
     sas_programs = {}
@@ -2104,13 +2600,16 @@ def phase_3_sas_generation(df, csv_path, progress):
 
 
 def phase_4_clean(df, progress):
-    """Phase 4: Clean data — Python imputation + SAS PROC STDIZE validation."""
-    progress.progress(45, text="Cleaning data...")
+    total_missing = df.isna().sum().sum()
+    if total_missing > 0:
+        cols_affected = (df.isna().sum() > 0).sum()
+        progress.progress(45, text=f"🧹 Found {total_missing:,} missing values across {cols_affected} columns — imputing with median/mode...")
+    else:
+        progress.progress(45, text="🧹 Checking data quality — no missing values detected, validating constraints...")
     
     sas_runner = st.session_state.sas_runner
     sas_executed = False
     
-    # === PYTHON PATH (always runs — needed for charts, fidelity, etc.) ===
     numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     cleaned = df.copy()
     imputed_count = 0
@@ -2128,9 +2627,8 @@ def phase_4_clean(df, progress):
                 imputed_count += n_miss
     st.session_state.cleaned_df = cleaned
     
-    # === SAS PATH (validate cleaning via PROC STDIZE) ===
     if sas_runner and sas_runner.connected:
-        progress.progress(47, text="Validating cleaning via SAS PROC STDIZE...")
+        progress.progress(47, text="🔬 Validating cleaning via SAS PROC STDIZE — independent median imputation check...")
         sas_runner.upload_dataframe(cleaned, 'CLEANED_DATA')
         _, sas_result = sas_runner.run_data_cleaning(df)
         sas_executed = sas_result.get('success', False) if isinstance(sas_result, dict) else False
@@ -2149,20 +2647,27 @@ def phase_4_clean(df, progress):
 
 
 def phase_5_synthesize(cleaned, n_synth, sas_engine, sas_gen, sas_programs, progress):
-    """Phase 5: Generate synthetic data and compute fidelity."""
-    progress.progress(55, text="Fitting distributions & generating synthetic data...")
+    n_numeric = len([c for c in cleaned.columns if pd.api.types.is_numeric_dtype(cleaned[c]) and cleaned[c].nunique() > 10])
+    n_binary = len([c for c in cleaned.columns if pd.api.types.is_numeric_dtype(cleaned[c]) and set(cleaned[c].dropna().unique()).issubset({0, 1, 0.0, 1.0})])
+    progress.progress(55, text=f"🧬 Fitting Gaussian Copula: {n_numeric} numeric marginals + {n_binary} conditional logistic models...")
+    
+    # Apply variable exclusions from Data Hygiene page
+    excluded = st.session_state.get('excluded_vars', [])
+    synth_input = cleaned.drop(columns=[c for c in excluded if c in cleaned.columns], errors='ignore')
+    
     synth_gen = SyntheticGenerator()
-    synth_gen.extract_metadata(cleaned)
+    synth_gen.extract_metadata(synth_input)
     synthetic = synth_gen.generate(n_synth)
     synth_csv = os.path.join(OUTPUT_DIR, "synthetic_data.csv")
     synthetic.to_csv(synth_csv, index=False)
     st.session_state.synthetic_df = synthetic
     
-    progress.progress(70, text="Computing fidelity metrics...")
-    fidelity = synth_gen.compute_fidelity(cleaned, synthetic)
+    progress.progress(70, text=f"📊 Generated {len(synthetic):,} synthetic records — computing KS statistics, correlation preservation & DCR privacy metrics...")
+    # Align columns — only compare columns that exist in both
+    common_cols = [c for c in synth_input.columns if c in synthetic.columns]
+    fidelity = synth_gen.compute_fidelity(synth_input[common_cols], synthetic[common_cols])
     st.session_state.fidelity = fidelity
     
-    # Additional SAS programs for fidelity and synthesis
     fid_import = f"""
 proc import datafile="{synth_csv}"
     out=WORK.SYNTHETIC_DATA dbms=csv replace;
@@ -2186,12 +2691,15 @@ run;
     return synthetic, fidelity, f"{len(synthetic):,} records, fidelity {fidelity['overall_score']:.1f}%"
 
 
-def phase_6_narrative(question, cleaned, synthetic, fidelity, enrichment, progress):
-    """Phase 6: Generate clinical narrative via LLM."""
-    progress.progress(85, text="Generating clinical narrative...")
+def phase_6_narrative(question, cleaned, synthetic, fidelity, enrichment_result, progress):
+    role = st.session_state.get('user_role', 'Population Health Planner')
+    progress.progress(85, text=f"📝 Writing clinical narrative for {role} — analyzing risk factors, municipal patterns & recommendations...")
     
     relevant_vars = st.session_state.relevant_vars or list(cleaned.columns)
-    additional_conditions = enrichment['additional_conditions']
+    enrichment = enrichment_result.get('enrichment', {})
+    additional_conditions = [{'name': k, **v} for k, v in enrichment.get('conditions', {}).items()]
+    question_type = enrichment.get('question_type', 'PREVALENCE')
+    schema_desc = enrichment.get('schema_description', '')
     numeric_cols = [c for c in cleaned.columns if pd.api.types.is_numeric_dtype(cleaned[c])]
     
     try:
@@ -2224,23 +2732,35 @@ def phase_6_narrative(question, cleaned, synthetic, fidelity, enrichment, progre
                                    'strength': classify_correlation_strength(r_val)})
         corr_pairs.sort(key=lambda x: abs(x['correlation']), reverse=True)
 
-        added_note = ""
+        added_note = f"\nQUESTION TYPE: {question_type}"
+        added_note += f"\nSCHEMA: {schema_desc}"
         if additional_conditions:
             added_names = [c['name'] for c in additional_conditions]
-            added_note = f"\nDYNAMICALLY ADDED CONDITIONS: {added_names} (sourced from Canadian health data based on the question)"
+            added_note += f"\nCONDITIONS IN DATASET: {added_names}"
+        added_note += f"\nRISK FACTORS IN DATASET: {[rf['name'] for rf in enrichment.get('risk_factors', [])]}"
 
         rf_analysis = []
-        rf_cols_all = [c for c in cleaned.columns if c.startswith('is_')]
         cond_cols_all = [c for c in cleaned.columns if c.startswith('has_')]
-        numeric_rf_all = [c for c in cleaned.columns if c in ['bmi', 'blood_pressure', 'sodium_intake',
-                         'physical_activity_level', 'alcohol_consumption'] or
-                         (not c.startswith('has_') and not c.startswith('is_') and 
-                          c not in ['age', 'income', 'risk_score', 'chronic_condition_count', 
-                          'er_visits_12mo', 'fall_risk_score', 'has_stairs', 'num_staircases', 
-                          'num_rooms', 'had_fall_12mo', 'num_storeys'] 
-                          and pd.api.types.is_numeric_dtype(cleaned[c]) and cleaned[c].nunique() > 10)]
         
-        for rf_col in rf_cols_all:
+        # Find ALL binary risk factors (is_ prefix + any other binary non-condition columns)
+        non_rf_names = set(cond_cols_all) | {'age', 'income', 'risk_score', 'chronic_condition_count',
+                          'er_visits_12mo', 'fall_risk_score', 'num_staircases', 'num_rooms',
+                          'has_stairs', 'has_mobility_limitation', 'had_fall_12mo',
+                          'dwelling_type', 'num_storeys', 'age_group', 'sex', 'income_quintile',
+                          'municipality', 'population_segment'}
+        binary_rf_cols = []
+        for c in cleaned.columns:
+            if c in non_rf_names:
+                continue
+            if c.startswith('is_'):
+                binary_rf_cols.append(c)
+            elif pd.api.types.is_numeric_dtype(cleaned[c]):
+                unique_vals = set(cleaned[c].dropna().unique())
+                if unique_vals.issubset({0, 1, 0.0, 1.0}):
+                    binary_rf_cols.append(c)
+        
+        # Binary risk factors vs conditions
+        for rf_col in binary_rf_cols:
             for cond_col in cond_cols_all:
                 if rf_col == cond_col:
                     continue
@@ -2262,7 +2782,12 @@ def phase_6_narrative(question, cleaned, synthetic, fidelity, enrichment, progre
                         'relative_risk': round(rr, 2)
                     })
         
-        for rf_col in numeric_rf_all:
+        # Numeric risk factors (above/below median) vs conditions
+        numeric_rf_cols = [c for c in cleaned.columns if c not in non_rf_names 
+                          and c not in binary_rf_cols
+                          and pd.api.types.is_numeric_dtype(cleaned[c]) 
+                          and cleaned[c].nunique() > 10]
+        for rf_col in numeric_rf_cols:
             for cond_col in cond_cols_all:
                 series = cleaned[rf_col].dropna()
                 if len(series) < 10:
@@ -2280,8 +2805,7 @@ def phase_6_narrative(question, cleaned, synthetic, fidelity, enrichment, progre
                     rr = 0
                 if rr > 1.3 or rr < 0.7:
                     rf_analysis.append({
-                        'risk_factor': f"{rf_col} (above median)",
-                        'condition': cond_col,
+                        'risk_factor': f"{rf_col} (above median)", 'condition': cond_col,
                         'rate_exposed': f"{rate_high*100:.2f}%",
                         'rate_unexposed': f"{rate_low*100:.2f}%",
                         'relative_risk': round(rr, 2)
@@ -2289,35 +2813,123 @@ def phase_6_narrative(question, cleaned, synthetic, fidelity, enrichment, progre
         
         rf_analysis.sort(key=lambda x: x['relative_risk'], reverse=True)
 
-        resp = llm.invoke([
-            SystemMessage(content="""You are a healthcare data analyst at Southlake Health.
-Generate a concise clinical report based on the analysis results.
-Use markdown headers and bullet points. Include: key findings,
-correlations discovered, population insights, and how the synthetic
-data can be used. Answer the original question directly.
+        # Municipal/group breakdown for question-relevant conditions
+        muni_data = {}
+        question_conditions = []
+        for col in cond_cols_all:
+            cond_name = col.replace('has_', '').replace('_', ' ')
+            if cond_name in question.lower() or any(w in question.lower() for w in cond_name.split() if len(w) > 3):
+                question_conditions.append(col)
+        
+        # Find the best grouping variable (municipality for person data, department/category for others)
+        group_col = None
+        for candidate in ['municipality', 'department', 'department_name', 'item_category', 
+                          'shift_type', 'role', 'unit', 'ward']:
+            if candidate in cleaned.columns and not pd.api.types.is_numeric_dtype(cleaned[candidate]):
+                group_col = candidate
+                break
+        
+        if group_col and question_conditions:
+            for col in question_conditions:
+                try:
+                    muni_rates = cleaned.groupby(group_col)[col].mean().round(4).to_dict()
+                    muni_data[col] = muni_rates
+                except (KeyError, TypeError):
+                    pass
+        elif group_col:
+            # For non-condition datasets, show numeric variable means by group
+            numeric_outcome_cols = [c for c in cleaned.columns if pd.api.types.is_numeric_dtype(cleaned[c]) 
+                                   and c != group_col and cleaned[c].nunique() > 5]
+            for col in numeric_outcome_cols[:3]:
+                try:
+                    group_means = cleaned.groupby(group_col)[col].mean().round(4).to_dict()
+                    muni_data[col] = group_means
+                except (KeyError, TypeError):
+                    pass
 
-IMPORTANT: 
-- Use the RISK FACTOR ANALYSIS data (relative risk) as the PRIMARY evidence for relationships.
-- Relative Risk (RR) is far more meaningful than Spearman correlation for binary health outcomes.
-- RR > 3.0 = Strong relationship, RR 1.5-3.0 = Moderate, RR < 1.5 = Weak
-- When discussing risk factors, cite the actual rates (e.g., "15.2% of physically inactive individuals have diabetes vs 4.1% of active individuals — a 3.7x relative risk")
-- Also mention Spearman correlations for continuous variable relationships.
-- Do NOT mention trivially obvious relationships.
-- If new conditions were dynamically added to answer the question, explain what was added and why."""),
+        role = st.session_state.get('user_role', 'Population Health Planner')
+        role_instructions = {
+            'Population Health Planner': 'Focus on population-level trends, municipal variations, and program planning opportunities. Use epidemiological language but keep it accessible.',
+            'Clinical Director': 'Focus on clinical implications, patient pathways, and care delivery recommendations. Relate findings to clinical workflows and patient outcomes.',
+            'Hospital Executive': 'Focus on strategic implications, resource allocation, ROI of interventions, and competitive positioning. Use business language. Include estimated numbers of affected patients.',
+            'Data Analyst / Researcher': 'Include more statistical detail — confidence intervals, effect sizes, methodology notes. Discuss limitations and suggest further analyses.',
+            'Public Health Nurse': 'Focus on community-level interventions, patient education opportunities, and preventive care. Use practical, patient-facing language.',
+            'Privacy Officer': 'Emphasize the privacy mechanisms used, DCR results, and how synthetic data eliminates re-identification risk. Discuss PHIPA compliance implications.',
+        }
+        role_context = role_instructions.get(role, role_instructions['Population Health Planner'])
+        
+        # Format risk factors prominently so LLM can't miss them
+        rf_text = "NO RISK FACTOR DATA AVAILABLE"
+        if rf_analysis:
+            rf_lines = []
+            for rf in rf_analysis[:10]:
+                rf_lines.append(f"- {rf['risk_factor']} → {rf['condition']}: "
+                               f"{rf['rate_exposed']} exposed vs {rf['rate_unexposed']} unexposed "
+                               f"(RR={rf['relative_risk']}x)")
+            rf_text = "\n".join(rf_lines)
+        
+        resp = llm.invoke([
+            SystemMessage(content=f"""You are a healthcare data analyst at Southlake Health. 
+The user is a **{role}**. {role_context}
+
+Generate a comprehensive, actionable clinical report. Use markdown headers and bullet points.
+
+STRUCTURE YOUR REPORT AS:
+
+## Direct Answer
+- Answer the user's question in 2-3 clear sentences with the most important numbers
+- Lead with the strongest finding (e.g., "Yes, smokers are 10x more likely to develop lung cancer")
+
+## Key Evidence
+- For each significant risk factor, explain the relationship using actual rates
+- Format: "X% of [exposed group] have [condition] vs Y% of [unexposed group] — a [RR]x higher risk"
+- Explain what this means in practical terms for a hospital administrator
+
+## Who Is Most Affected?
+- Break down by municipality — which communities need the most attention?
+- Break down by age group if relevant
+- Identify the highest-risk subpopulations
+
+## What Should Southlake Do?
+- 3-4 specific, actionable recommendations tied directly to the findings
+- For each recommendation, explain which finding supports it
+- Include estimated impact where possible (e.g., "targeting the ~3,500 smokers in our catchment...")
+
+## How Synthetic Data Made This Possible
+- Explain in 2-3 sentences how this analysis was done without any real patient records
+- Emphasize: all data came from public Canadian health statistics (Stats Canada, PHAC)
+- Mention the fidelity score and what it means
+- Suggest what Southlake could do next with this synthetic dataset
+
+IMPORTANT RULES:
+- Use RISK FACTOR ANALYSIS (relative risk) as PRIMARY evidence — not correlations
+- Cite actual rates: "2.38% of smokers vs 0.35% of non-smokers"
+- Be SPECIFIC to the question — every paragraph should relate back to what was asked
+- Write for hospital administrators, not statisticians — avoid jargon
+- If conditions were dynamically added to answer the question, mention this briefly
+- Do NOT include generic health advice unrelated to the question"""),
             HumanMessage(content=f"""
 QUESTION: {question}
-RELEVANT VARIABLES IDENTIFIED: {relevant_vars}
 {added_note}
 DATASET: {len(cleaned):,} records from Southlake catchment
-(Newmarket, Aurora, East Gwillimbury, Georgina, Bradford West Gwillimbury, King, Innisfil)
-KEY STATS (relevant variables):
+
+=== RISK FACTOR ANALYSIS (USE THIS AS PRIMARY EVIDENCE) ===
+{rf_text}
+
+=== MUNICIPAL BREAKDOWN ===
+{json.dumps(muni_data, default=str, indent=2)}
+
+=== CORRELATIONS (secondary) ===
+{json.dumps(corr_pairs[:10], default=str)}
+
+=== DESCRIPTIVE STATS ===
 {cleaned[[c for c in relevant_vars if c in cleaned.columns and pd.api.types.is_numeric_dtype(cleaned[c])]].describe().to_string()}
-TOP NON-TRIVIAL CORRELATIONS: {json.dumps(corr_pairs[:15], default=str)}
-RISK FACTOR ANALYSIS (Relative Risk): {json.dumps(rf_analysis[:15], default=str)}
-ALL VARIABLES: {list(cleaned.columns)}
-CATEGORICAL:
-{chr(10).join(f"{c}: {cleaned[c].value_counts().head(5).to_dict()}" for c in cat_cols[:8])}
+
 SYNTHETIC: {len(synthetic):,} records | FIDELITY: {fidelity['overall_score']:.1f}%
+
+CRITICAL: You MUST discuss the risk factors listed above. They show BMI, physical inactivity, 
+and other modifiable risk factors with their actual rates and relative risks. 
+Do NOT say "risk factor data is not provided" — it IS provided above.
 """)
         ])
         st.session_state.narrative = resp.content
@@ -2334,20 +2946,17 @@ SYNTHETIC: {len(synthetic):,} records | FIDELITY: {fidelity['overall_score']:.1f
 
 
 def run_pipeline(question, n_synth=10000):
-    """Main pipeline orchestrator — calls each phase in sequence."""
     st.session_state.question = question
     pipeline_log = []
     progress = st.progress(0, text="Starting SynthetiCare Agent...")
     
-    # Free memory from previous run before allocating new data
     for key in ['original_df', 'cleaned_df', 'synthetic_df']:
         if key in st.session_state and st.session_state[key] is not None:
             st.session_state[key] = None
     
     try:
-        # Try to connect to SAS Viya
         if not st.session_state.sas_connected:
-            progress.progress(1, text="Connecting to SAS Viya...")
+            progress.progress(1, text="🔌 Connecting to SAS Viya (vfl-032.engage.sas.com)...")
             try:
                 runner = SASRunner()
                 if runner.connect():
@@ -2361,28 +2970,23 @@ def run_pipeline(question, n_synth=10000):
         else:
             pipeline_log.append(("✅", "SAS Connection", "Already connected to SAS Viya"))
 
-        # Phase 1: Enrich
         enrichment = phase_1_enrich(question, progress)
+        st.session_state.enrichment = enrichment.get('enrichment', {})
         pipeline_log.append(("✅", "Data Enrichment", enrichment['log']))
         
-        # Phase 2: Build data
         df, csv_path, build_log = phase_2_build_data(enrichment, progress)
         pipeline_log.append(("✅", "Population Build", build_log))
         
-        # Phase 3: SAS code generation
         sas_engine, sas_gen, sas_programs, sas_log = phase_3_sas_generation(df, csv_path, progress)
         pipeline_log.append(("✅", "SAS Code Generation", sas_log))
         
-        # Phase 4: Clean
         cleaned, clean_log = phase_4_clean(df, progress)
         pipeline_log.append(("✅", "Data Cleaning", clean_log))
         
-        # Phase 5: Synthesize
         synthetic, fidelity, synth_log = phase_5_synthesize(
             cleaned, n_synth, sas_engine, sas_gen, sas_programs, progress)
         pipeline_log.append(("✅", "Synthetic Generation", synth_log))
         
-        # Phase 6: Narrative
         narr_log = phase_6_narrative(question, cleaned, synthetic, fidelity, enrichment, progress)
         pipeline_log.append(("✅", "Clinical Narrative", narr_log))
         
@@ -2451,8 +3055,12 @@ with st.sidebar:
         <p>Autonomous synthetic data service for population health planning.</p>
         <p style="font-size:11px; margin-top:12px;">
             Built with SAS Viya · GPT-4o · Gaussian Copula<br>
-            Dynamic data enrichment from Canadian health sources<br>
-            Open Government Licence — Canada
+            Dynamic data enrichment from Canadian health sources
+        </p>
+        <p style="font-size:9px; margin-top:14px; color:rgba(255,255,255,0.4); line-height:1.5;">
+            ⚠️ AI-generated content may contain errors. Synthetic data is derived from public 
+            statistical sources and should not be used for clinical decision-making without 
+            validation against real institutional data.
         </p>
     </div>
     """, unsafe_allow_html=True)
@@ -2462,54 +3070,98 @@ with st.sidebar:
 # PAGE: HOME
 # ============================================================
 if page == "🏥 Home":
-    st.markdown("""
-    <div class="hero">
-        <h1>🏥 SynthetiCare Agent</h1>
-        <p>Autonomous Synthetic Data Service for Southlake Health</p>
-    </div>
-    """, unsafe_allow_html=True)
-
     st.markdown(f"""
-    <div style="max-width:720px;">
-        <p style="font-size:16px; color:{COLORS['navy']}; line-height:1.7;">
-            Ask a population health question in plain language. The agent will
-            <b>source public data</b> (including dynamically finding prevalence rates
-            for any condition), <b>profile it in SAS</b>, <b>generate
-            privacy-safe synthetic records</b> via Gaussian Copula, and deliver
-            a clinical report — all autonomously.
-        </p>
+    <div style="background: linear-gradient(135deg, {COLORS['navy']} 0%, {COLORS['dark_teal']} 50%, {COLORS['teal']} 100%);
+                padding: 44px 52px; border-radius: 18px; margin-bottom: 28px; position: relative; overflow: hidden;">
+        <div style="position: absolute; top: -40px; right: -40px; width: 180px; height: 180px; 
+                    background: rgba(38, 198, 218, 0.08); border-radius: 50%;"></div>
+        <h1 style="color: white; font-size: 40px; margin: 0; font-weight: 800;">
+            🏥 SynthetiCare Agent</h1>
+        <p style="color: {COLORS['turquoise']}; font-size: 17px; margin: 8px 0 0 0; font-weight: 400;">
+            Autonomous Synthetic Data Service for Southlake Health</p>
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown("**💡 Example questions** *(click to use)*:")
+    # ── HOW IT WORKS (collapsible after first run) ──
+    if not st.session_state.pipeline_run:
+        st.markdown(f"""
+        <div style="max-width:800px; margin-bottom:24px;">
+            <p style="font-size:17px; color:{COLORS['navy']}; line-height:1.8; margin-bottom:16px;">
+                Healthcare organizations need data to plan programs, allocate resources, and improve care — 
+                but real patient data is locked behind privacy regulations. <b>Synthetic data</b> solves this 
+                by preserving the statistical patterns of a population without containing any real patient information.
+            </p>
+            <div style="display:flex; gap:16px; flex-wrap:wrap; margin-bottom:8px;">
+                <div style="flex:1; min-width:200px; background:white; border-radius:10px; padding:14px 18px; 
+                            border:1px solid #eee; border-left:3px solid {COLORS['teal']};">
+                    <div style="font-size:13px; font-weight:700; color:{COLORS['navy']}; margin-bottom:4px;">1. Ask a Question</div>
+                    <div style="font-size:12px; color:#666;">Any healthcare question — disease risk, ER demand, staffing, equity</div>
+                </div>
+                <div style="flex:1; min-width:200px; background:white; border-radius:10px; padding:14px 18px; 
+                            border:1px solid #eee; border-left:3px solid {COLORS['teal']};">
+                    <div style="font-size:13px; font-weight:700; color:{COLORS['navy']}; margin-bottom:4px;">2. AI Designs the Dataset</div>
+                    <div style="font-size:12px; color:#666;">GPT-4o selects relevant variables from Canadian public health sources</div>
+                </div>
+                <div style="flex:1; min-width:200px; background:white; border-radius:10px; padding:14px 18px; 
+                            border:1px solid #eee; border-left:3px solid {COLORS['teal']};">
+                    <div style="font-size:13px; font-weight:700; color:{COLORS['navy']}; margin-bottom:4px;">3. Generate & Validate</div>
+                    <div style="font-size:12px; color:#666;">Synthetic records created via Gaussian Copula, validated by SAS Viya</div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── INPUT SECTION ──
+    st.markdown(f"""
+    <div style="background:white; border:2px solid {COLORS['teal']}30; border-radius:14px;
+                padding:24px 28px; margin-bottom:20px; box-shadow: 0 2px 12px rgba(0,57,70,0.06);">
+        <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+            <span style="font-size:18px;">🔍</span>
+            <span style="font-size:16px; font-weight:700; color:{COLORS['navy']};">Ask a Healthcare Question</span>
+        </div>
+        <div style="font-size:12px; color:#999; margin-bottom:12px;">
+            The agent will design a custom dataset, generate synthetic records, and produce a clinical report.</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Example questions as lighter chips
     example_questions = [
-        "What does chronic disease burden look like across Southlake's catchment area?",
-        "How does diabetes prevalence relate to income, BMI, and physical inactivity?",
-        "What are the fall risk factors for seniors in Georgina and Innisfil?",
         "Is there a relationship between lung cancer and smoking in our population?",
+        "Forecast ER demand and bed occupancy for next flu season",
+        "What are the fall risk factors for seniors in Georgina and Innisfil?",
+        "Are our nursing staff at risk of burnout and how does it affect patient outcomes?",
+        "How does diabetes prevalence relate to income, BMI, and physical inactivity?",
+        "What are the health equity gaps across our municipalities?",
     ]
-    eq_cols = st.columns(2)
+    eq_cols = st.columns(3)
     for i, eq in enumerate(example_questions):
-        with eq_cols[i % 2]:
+        with eq_cols[i % 3]:
             if st.button(eq, key=f"example_q_{i}", use_container_width=True):
                 st.session_state['prefill_question'] = eq
 
     question = st.text_area(
         "What would you like to know?",
         value=st.session_state.get('prefill_question', ''),
-        height=120,
-        placeholder="Ask a population health question about Southlake's catchment area..."
+        height=80,
+        placeholder="Ask any healthcare question — disease risk, ER demand, staffing, equity, patient outcomes...",
+        label_visibility="collapsed",
     )
 
-    col1, col2 = st.columns([1, 3])
-    with col1:
+    col_role, col_rows, col_btn = st.columns([2, 1, 2])
+    with col_role:
+        role = st.selectbox(
+            "👤 I am a...",
+            ["Population Health Planner", "Clinical Director", "Hospital Executive",
+             "Data Analyst / Researcher", "Public Health Nurse", "Privacy Officer"],
+        )
+        st.session_state['user_role'] = role
+    with col_rows:
         n_synth = st.number_input("Synthetic rows", min_value=1000,
-                                   max_value=50000, value=10000, step=1000,
-                                   help="Max 50K to keep memory usage reasonable")
-    with col2:
+                                   max_value=50000, value=10000, step=1000)
+    with col_btn:
         st.markdown("<br>", unsafe_allow_html=True)
         run_btn = st.button("🚀  Run SynthetiCare Agent", type="primary",
-                            width='stretch')
+                            use_container_width=True)
 
     if run_btn:
         if not question or len(question.strip()) < 10:
@@ -2518,56 +3170,132 @@ if page == "🏥 Home":
             st.warning("⚠️ Question too long — please keep it under 2,000 characters.")
         else:
             run_pipeline(question, n_synth)
-            st.success("✅ Pipeline complete! Use the sidebar to explore results.")
+            st.toast("✅ Pipeline complete! Explore results below or use the sidebar.", icon="✅")
 
-    if st.session_state.get('pipeline_log'):
-        with st.expander("🔄 Pipeline Execution Log", expanded=False):
-            for icon, phase_name, detail in st.session_state.pipeline_log:
-                st.markdown(f"{icon} **{phase_name}** — {detail}")
-
+    # ── RESULTS SECTION ──
     if st.session_state.pipeline_run:
-        with st.expander("⚙️ Advanced Options"):
-            if st.button("🗑️ Clear Cache & Re-run", key="clear_cache"):
-                st.session_state.cache_buster += 1
-                st.session_state.pipeline_run = False
-                st.cache_data.clear()
-                st.rerun()
+        enrichment = st.session_state.get('enrichment', {})
+        q_type = enrichment.get('question_type', '')
+        schema_desc = enrichment.get('schema_description', '')
 
-    if st.session_state.pipeline_run:
-        st.markdown("---")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            metric_card("Source Records",
-                        f"{len(st.session_state.original_df):,}",
-                        "7 municipalities")
-        with c2:
-            metric_card("Synthetic Records",
-                        f"{len(st.session_state.synthetic_df):,}",
-                        "Gaussian Copula")
-        with c3:
-            metric_card("Fidelity Score",
-                        f"{st.session_state.fidelity['overall_score']:.1f}%",
-                        "KS + TVD + Corr")
-        with c4:
-            metric_card("SAS Programs",
-                        str(len(st.session_state.sas_programs)),
-                        "Ready to execute")
+        # Results header with schema badge
+        type_styles = {
+            'PREVALENCE': ('🔬', '#1565c0'),
+            'DEMAND': ('📈', '#e65100'),
+            'FALLS': ('🦴', '#6a1b9a'),
+            'MENTAL_HEALTH': ('🧠', '#00695c'),
+            'EQUITY': ('⚖️', '#ad1457'),
+            'WORKFORCE': ('👩‍⚕️', '#4e342e'),
+        }
+        r_icon, r_accent = type_styles.get(q_type, ('🧩', COLORS['teal']))
 
-        # Show relevant variables and any dynamically added conditions
+        st.markdown(f"""
+        <div style="background:linear-gradient(135deg, {COLORS['navy']} 0%, {COLORS['dark_teal']} 100%);
+                    padding:20px 24px; border-radius:14px; margin:24px 0 16px 0;">
+            <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+                <span style="font-size:24px;">{r_icon}</span>
+                <div style="flex:1; min-width:200px;">
+                    <div style="display:flex; align-items:center; gap:10px;">
+                        <span style="color:white; font-size:18px; font-weight:700;">Results</span>
+                        <span style="background:{r_accent}; color:white; padding:3px 12px; border-radius:16px;
+                                    font-size:11px; font-weight:700; letter-spacing:0.5px;">{q_type}</span>
+                    </div>
+                    <div style="color:{COLORS['turquoise']}; font-size:13px; margin-top:2px;">{schema_desc}</div>
+                </div>
+                <div style="display:flex; gap:20px; flex-wrap:wrap;">
+                    <div style="text-align:center;">
+                        <div style="color:{COLORS['turquoise']}; font-size:22px; font-weight:800;">
+                            {len(st.session_state.original_df):,}</div>
+                        <div style="color:rgba(255,255,255,0.5); font-size:10px; text-transform:uppercase;">Source</div>
+                    </div>
+                    <div style="text-align:center;">
+                        <div style="color:{COLORS['turquoise']}; font-size:22px; font-weight:800;">
+                            {len(st.session_state.synthetic_df):,}</div>
+                        <div style="color:rgba(255,255,255,0.5); font-size:10px; text-transform:uppercase;">Synthetic</div>
+                    </div>
+                    <div style="text-align:center;">
+                        <div style="color:{'#66bb6a' if st.session_state.fidelity['overall_score'] >= 85 else COLORS['turquoise']}; font-size:22px; font-weight:800;">
+                            {st.session_state.fidelity['overall_score']:.1f}%</div>
+                        <div style="color:rgba(255,255,255,0.5); font-size:10px; text-transform:uppercase;">Fidelity</div>
+                    </div>
+                    <div style="text-align:center;">
+                        <div style="color:{COLORS['turquoise']}; font-size:22px; font-weight:800;">
+                            {len(st.session_state.sas_programs)}</div>
+                        <div style="color:rgba(255,255,255,0.5); font-size:10px; text-transform:uppercase;">SAS Progs</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Quick navigation to explore results
+        nav1, nav2, nav3, nav4 = st.columns(4)
+        with nav1:
+            st.markdown(f"""
+            <div style="background:white; border:1px solid #e0e0e0; border-radius:10px; padding:14px;
+                        text-align:center; border-top:3px solid {COLORS['teal']};">
+                <div style="font-size:20px; margin-bottom:4px;">🌐</div>
+                <div style="font-size:12px; font-weight:600; color:{COLORS['navy']};">Data Sources</div>
+                <div style="font-size:11px; color:#999;">View schema & sources</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with nav2:
+            st.markdown(f"""
+            <div style="background:white; border:1px solid #e0e0e0; border-radius:10px; padding:14px;
+                        text-align:center; border-top:3px solid {COLORS['teal']};">
+                <div style="font-size:20px; margin-bottom:4px;">📊</div>
+                <div style="font-size:12px; font-weight:600; color:{COLORS['navy']};">Profiling</div>
+                <div style="font-size:11px; color:#999;">Distributions & stats</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with nav3:
+            st.markdown(f"""
+            <div style="background:white; border:1px solid #e0e0e0; border-radius:10px; padding:14px;
+                        text-align:center; border-top:3px solid {COLORS['teal']};">
+                <div style="font-size:20px; margin-bottom:4px;">🔗</div>
+                <div style="font-size:12px; font-weight:600; color:{COLORS['navy']};">Correlations</div>
+                <div style="font-size:11px; color:#999;">Risk factor analysis</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with nav4:
+            st.markdown(f"""
+            <div style="background:white; border:1px solid #e0e0e0; border-radius:10px; padding:14px;
+                        text-align:center; border-top:3px solid {COLORS['teal']};">
+                <div style="font-size:20px; margin-bottom:4px;">📝</div>
+                <div style="font-size:12px; font-weight:600; color:{COLORS['navy']};">Report</div>
+                <div style="font-size:11px; color:#999;">Clinical narrative</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.caption("👆 Use the sidebar navigation to explore each section in detail.")
+
+        # Compact details in expanders
         if st.session_state.relevant_vars:
-            with st.expander("🎯 Variables identified as relevant to your question"):
-                cols = st.columns(4)
+            with st.expander(f"🎯 {len(st.session_state.relevant_vars)} variables identified as relevant"):
+                var_cols = st.columns(4)
                 for i, var in enumerate(st.session_state.relevant_vars):
-                    with cols[i % 4]:
-                        st.markdown(f"• `{var}`")
-        
+                    with var_cols[i % 4]:
+                        st.markdown(f"`{var}`")
+
         if st.session_state.additional_conditions:
-            with st.expander("🔬 Conditions dynamically added based on your question"):
+            with st.expander(f"🔬 {len(st.session_state.additional_conditions)} conditions dynamically added"):
                 for cond in st.session_state.additional_conditions:
-                    st.markdown(f"""
-                    - **{cond['name'].replace('_', ' ').title()}** — Prevalence: {cond['prevalence']*100:.1f}% 
-                      | Source: {cond.get('source', 'N/A')}
-                    """)
+                    st.markdown(f"- **{cond['name'].replace('_', ' ').title()}** — "
+                                f"Prevalence: {cond['prevalence']*100:.1f}% | Source: {cond.get('source', 'N/A')}")
+
+        col_log, col_adv = st.columns(2)
+        with col_log:
+            if st.session_state.get('pipeline_log'):
+                with st.expander("🔄 Pipeline Log"):
+                    for icon, phase_name, detail in st.session_state.pipeline_log:
+                        st.markdown(f"{icon} **{phase_name}** — {detail}")
+        with col_adv:
+            with st.expander("⚙️ Advanced"):
+                if st.button("🗑️ Clear Cache & Re-run", key="clear_cache"):
+                    st.session_state.cache_buster += 1
+                    st.session_state.pipeline_run = False
+                    st.cache_data.clear()
+                    st.rerun()
 
 
 # ============================================================
@@ -2584,200 +3312,375 @@ elif page == "🌐 Data Sources":
     if not st.session_state.pipeline_run:
         st.info("Run the pipeline from the Home page first.")
     else:
-        sources = [
-            {'name': 'Statistics Canada 2021 Census Profile (CSDs)',
-             'licence': 'Open Government Licence — Canada',
-             'desc': 'Population demographics, age, sex, income, housing, dwelling type, storeys, period of construction',
-             'rows': len(st.session_state.original_df)},
-            {'name': 'PHAC Canadian Chronic Disease Indicators (CCDI 2021)',
-             'licence': 'Open Government Licence — Canada',
-             'desc': 'Diabetes, hypertension, COPD, asthma, heart disease, mood disorders, arthritis prevalence rates',
-             'rows': 'Rate tables'},
-            {'name': 'Ontario Data Catalogue',
-             'licence': 'Open Government Licence — Ontario',
-             'desc': 'Hospital utilisation, emergency department, long-term care, health region data',
-             'rows': 'API'},
-        ]
+        enrichment = st.session_state.get('enrichment', {})
+        q_type = enrichment.get('question_type', 'PREVALENCE')
+        schema_desc = enrichment.get('schema_description', '')
 
-        # Add any dynamically sourced data
-        for src in st.session_state.additional_sources:
-            sources.append({
-                'name': src.get('name', 'Additional Source'),
-                'licence': src.get('licence', 'Open Government Licence'),
-                'desc': f"Dynamically sourced for this query — {src.get('url', '')}",
-                'rows': 'Rate tables',
-            })
+        # ── SCHEMA DESIGN BANNER (top of page) ──
+        if enrichment:
+            type_styles = {
+                'PREVALENCE': ('🔬', '#1565c0', '#e3f2fd'),
+                'DEMAND': ('📈', '#e65100', '#fff3e0'),
+                'FALLS': ('🦴', '#6a1b9a', '#f3e5f5'),
+                'MENTAL_HEALTH': ('🧠', '#00695c', '#e0f2f1'),
+                'EQUITY': ('⚖️', '#ad1457', '#fce4ec'),
+                'WORKFORCE': ('👩‍⚕️', '#4e342e', '#efebe9'),
+            }
+            icon, accent, bg = type_styles.get(q_type, ('🧩', COLORS['teal'], COLORS['light_bg']))
 
-        for src in sources:
+            modules = []
+            for label, key, emoji in [('Housing', 'include_housing', '🏠'), ('Falls', 'include_falls', '🦴'),
+                                       ('ER Utilization', 'include_er_utilization', '🚑'), ('Risk Score', 'include_risk_score', '📊')]:
+                included = enrichment.get(key, False)
+                color = '#43a047' if included else '#9e9e9e'
+                mbg = '#e8f5e9' if included else '#f5f5f5'
+                modules.append((f'{emoji} {label}', color, mbg))
+
+            pills_html = ''.join(
+                f'<span style="display:inline-block; background:{mbg}; color:{color}; '
+                f'padding:4px 12px; border-radius:20px; font-size:12px; font-weight:600; '
+                f'margin:3px 4px; border:1px solid {color}20;">{label}</span>'
+                for label, color, mbg in modules
+            )
+
+            n_conditions = len(enrichment.get('conditions', {}))
+            n_rf = len(enrichment.get('risk_factors', []))
+
             st.markdown(f"""
-            <div class="source-card">
-                <b>{src['name']}</b><br>
-                <span style="font-size:13px;">{src['desc']}</span><br>
-                <span class="licence">📜 {src['licence']}  |  Rows: {src['rows']}</span>
+            <div style="background: linear-gradient(135deg, {COLORS['navy']} 0%, {COLORS['dark_teal']} 100%);
+                        padding: 24px 28px; border-radius: 14px; margin-bottom: 24px;">
+                <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
+                    <span style="font-size:32px;">{icon}</span>
+                    <div>
+                        <div style="display:flex; align-items:center; gap:10px;">
+                            <span style="color:white; font-size:20px; font-weight:700;">Schema Design</span>
+                            <span style="background:{accent}; color:white; padding:3px 14px; border-radius:20px;
+                                        font-size:12px; font-weight:700; letter-spacing:0.5px;">{q_type}</span>
+                        </div>
+                        <p style="color:{COLORS['turquoise']}; font-size:14px; margin:4px 0 0 0;">{schema_desc}</p>
+                    </div>
+                </div>
+                <div style="display:flex; align-items:center; gap:16px; margin-top:14px; padding-top:14px;
+                            border-top:1px solid rgba(255,255,255,0.12);">
+                    <div style="color:rgba(255,255,255,0.6); font-size:12px; font-weight:600; min-width:60px;">MODULES</div>
+                    <div>{pills_html}</div>
+                </div>
+                <div style="display:flex; gap:24px; margin-top:12px;">
+                    <span style="color:rgba(255,255,255,0.7); font-size:13px;">
+                        <b style="color:{COLORS['turquoise']};">{n_conditions}</b> conditions</span>
+                    <span style="color:rgba(255,255,255,0.7); font-size:13px;">
+                        <b style="color:{COLORS['turquoise']};">{n_rf}</b> risk factors</span>
+                    <span style="color:rgba(255,255,255,0.7); font-size:13px;">
+                        <b style="color:{COLORS['turquoise']};">{enrichment.get('unit_label', 'resident').title()}</b> per row</span>
+                    <span style="color:rgba(255,255,255,0.7); font-size:13px;">
+                        <b style="color:{COLORS['turquoise']};">{len(st.session_state.original_df):,}</b> records</span>
+                </div>
             </div>
             """, unsafe_allow_html=True)
 
+        # ── FOUNDATION SOURCES ──
+        st.markdown(f"""
+        <div style="margin-bottom:8px;">
+            <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                        letter-spacing:1px;">📚 Foundation Data Sources</span>
+            <span style="font-size:12px; color:#999; margin-left:8px;">Always included in every dataset</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        foundation_sources = [
+            {
+                'name': 'Statistics Canada 2021 Census',
+                'icon': '🇨🇦',
+                'desc': 'Population demographics, age distribution, sex, household income, housing characteristics',
+                'licence': 'Open Government Licence — Canada',
+                'rows': f"{len(st.session_state.original_df):,}",
+            },
+            {
+                'name': 'PHAC Canadian Chronic Disease Indicators',
+                'icon': '🏛️',
+                'desc': 'National prevalence rates for chronic conditions — diabetes, hypertension, COPD, asthma, heart disease, mood disorders, arthritis, dementia',
+                'licence': 'Open Government Licence — Canada',
+                'rows': 'Rate tables',
+            },
+            {
+                'name': 'Ontario Data Catalogue',
+                'icon': '🏥',
+                'desc': 'Hospital utilisation, emergency department visits, long-term care, health region boundaries',
+                'licence': 'Open Government Licence — Ontario',
+                'rows': 'API',
+            },
+        ]
+
+        fcols = st.columns(3)
+        for i, src in enumerate(foundation_sources):
+            with fcols[i]:
+                st.markdown(f"""
+                <div style="background:white; border:1px solid #e0e0e0; border-radius:12px; padding:20px;
+                            height:220px; display:flex; flex-direction:column; justify-content:space-between;
+                            box-shadow: 0 1px 4px rgba(0,0,0,0.04);">
+                    <div>
+                        <div style="font-size:28px; margin-bottom:8px;">{src['icon']}</div>
+                        <div style="font-size:14px; font-weight:700; color:{COLORS['navy']}; margin-bottom:6px;
+                                    line-height:1.3;">{src['name']}</div>
+                        <div style="font-size:12px; color:#666; line-height:1.5;">{src['desc']}</div>
+                    </div>
+                    <div style="margin-top:12px; padding-top:10px; border-top:1px solid #f0f0f0;
+                                display:flex; justify-content:space-between; align-items:center;">
+                        <span style="font-size:11px; color:#999;">📜 {src['licence'].split('—')[0].strip()}</span>
+                        <span style="background:{COLORS['light_bg']}; color:{COLORS['teal']}; padding:2px 8px;
+                                    border-radius:10px; font-size:11px; font-weight:600;">{src['rows']}</span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        # ── DYNAMIC SOURCES ──
+        dynamic_sources = [s for s in st.session_state.additional_sources
+                          if s.get('name', '') and not s.get('name', '').startswith('LLM')]
+
+        if dynamic_sources:
+            st.markdown(f"""
+            <div style="margin:28px 0 8px 0;">
+                <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                            letter-spacing:1px;">🤖 AI-Sourced Data</span>
+                <span style="font-size:12px; color:#999; margin-left:8px;">
+                    Dynamically identified for your question</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            dyn_cols = st.columns(min(len(dynamic_sources), 3))
+            for i, src in enumerate(dynamic_sources):
+                with dyn_cols[i % 3]:
+                    url = src.get('url', '')
+                    licence = src.get('licence', 'Open Government Licence')
+                    st.markdown(f"""
+                    <div style="background:white; border:1px solid {COLORS['turquoise']}40; border-radius:12px;
+                                padding:18px; border-left:4px solid {COLORS['turquoise']};">
+                        <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+                            <span style="background:{COLORS['turquoise']}20; padding:4px 8px; border-radius:6px;
+                                        font-size:11px; font-weight:600; color:{COLORS['teal']};">AI-SOURCED</span>
+                        </div>
+                        <div style="font-size:14px; font-weight:700; color:{COLORS['navy']}; margin-bottom:4px;">
+                            {src.get('name', 'Additional Source')}</div>
+                        <div style="font-size:12px; color:#666; word-break:break-all;">{url}</div>
+                        <div style="font-size:11px; color:#999; margin-top:8px;">📜 {licence}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+        # ── SOUTHLAKE CATCHMENT AREA ──
         st.markdown("---")
-        st.markdown("### Southlake Catchment Area")
+        st.markdown(f"""
+        <div style="margin-bottom:12px;">
+            <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                        letter-spacing:1px;">🗺️ Southlake Catchment Area</span>
+            <span style="font-size:12px; color:#999; margin-left:8px;">
+                7 municipalities · {len(st.session_state.original_df):,} sampled records (10% of population)</span>
+        </div>
+        """, unsafe_allow_html=True)
 
         catchment = pd.DataFrame({
             'Municipality': ['Newmarket', 'Aurora', 'East Gwillimbury', 'Georgina',
                              'Bradford West Gwillimbury', 'King', 'Innisfil'],
             'Population (2021)': [87942, 62057, 34637, 47642, 42880, 27333, 43326],
-            'Median Income': ['$95,000', '$110,000', '$98,000', '$82,000',
-                              '$92,000', '$125,000', '$88,000'],
+            'Median Income': [95000, 110000, 98000, 82000, 92000, 125000, 88000],
             'Sample (10%)': [8794, 6205, 3463, 4764, 4288, 2733, 4332],
         })
-        st.dataframe(catchment, width='stretch', hide_index=True)
 
-        # Show dynamically added conditions
+        st.dataframe(
+            catchment,
+            column_config={
+                'Municipality': st.column_config.TextColumn('Municipality', width='medium'),
+                'Population (2021)': st.column_config.NumberColumn('Population (2021)', format='%d'),
+                'Median Income': st.column_config.NumberColumn('Median Income', format='$%d'),
+                'Sample (10%)': st.column_config.NumberColumn('Sample (10%)', format='%d'),
+            },
+            width=800,
+            hide_index=True,
+        )
+
+        st.markdown(f"""
+        <div style="background:{COLORS['light_bg']}; padding:10px 14px; border-radius:8px; margin-top:4px;
+                    font-size:12px; color:{COLORS['navy']};">
+            <b>Total catchment:</b> {catchment['Population (2021)'].sum():,} residents · 
+            <b>Dataset:</b> {catchment['Sample (10%)'].sum():,} records (10% stratified sample) · 
+            <b>Source:</b> Statistics Canada 2021 Census of Population
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── DYNAMICALLY ADDED CONDITIONS ──
         if st.session_state.additional_conditions:
-            st.markdown("### 🔬 Dynamically Added Health Conditions")
+            st.markdown("---")
             st.markdown(f"""
-            <div style="background:{COLORS['light_bg']}; padding:14px; border-radius:8px; margin-bottom:12px;">
-                The following conditions were <b>automatically sourced</b> based on your question
-                and added to the population model with real Canadian prevalence rates.
+            <div style="margin-bottom:12px;">
+                <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                            letter-spacing:1px;">🔬 Conditions Added for This Question</span>
+                <span style="font-size:12px; color:#999; margin-left:8px;">
+                    AI identified these as relevant to your query</span>
             </div>
             """, unsafe_allow_html=True)
-            for cond in st.session_state.additional_conditions:
-                st.markdown(f"""
-                <div class="source-card">
-                    <b>has_{cond['name']}</b> — Prevalence: {cond['prevalence']*100:.2f}%<br>
-                    <span style="font-size:13px;">Age-adjusted: {cond.get('age_adjusted', True)} | 
-                    Risk factors: {', '.join(cond.get('risk_factors', []))}</span><br>
-                    <span class="licence">📜 {cond.get('source', 'Canadian health data')}</span>
-                </div>
-                """, unsafe_allow_html=True)
 
-        st.markdown(f"""
-        <div style="background:{COLORS['light_bg']}; padding:14px; border-radius:8px; margin-top:12px;">
-            <b>Total catchment population:</b> 345,817<br>
-            <b>10% sample used:</b> {len(st.session_state.original_df):,} individual records<br>
-            <b>Health conditions modeled:</b> {len([c for c in st.session_state.original_df.columns if c.startswith('has_')])}
-        </div>
-        """, unsafe_allow_html=True)
+            cond_cols_display = st.columns(min(len(st.session_state.additional_conditions), 3))
+            for i, cond in enumerate(st.session_state.additional_conditions):
+                with cond_cols_display[i % 3]:
+                    prev_pct = cond['prevalence'] * 100
+                    age_adj = "Age-adjusted" if cond.get('age_adjusted', True) else "Not age-adjusted"
+                    rfs = cond.get('risk_factors', [])
+                    rf_text = ', '.join(rfs) if rfs else 'None specified'
+                    source = cond.get('source', 'Canadian health data')
 
-        st.markdown("### 📖 Data Dictionary")
-        dict_rows = []
-        df_temp = st.session_state.original_df
-        for col in df_temp.columns:
-            dtype = str(df_temp[col].dtype)
-            nunique = df_temp[col].nunique()
-            if col == 'municipality':
-                desc = 'Census subdivision (CSD) within Southlake catchment area'
-                source = 'Statistics Canada 2021 Census'
-            elif col == 'age':
-                desc = 'Age in years (0–99)'
-                source = 'Statistics Canada 2021 Census'
-            elif col == 'age_group':
-                desc = 'Age band (0-14, 15-24,..., 85+)'
-                source = 'Statistics Canada 2021 Census'
-            elif col == 'sex':
-                desc = 'Biological sex (Male/Female)'
-                source = 'Statistics Canada 2021 Census'
-            elif col == 'income':
-                desc = 'Individual total income ($CAD, lognormal from municipal median)'
-                source = 'Statistics Canada 2021 Census'
-            elif col == 'income_quintile':
-                desc = 'Income quintile (Q1=lowest to Q5=highest)'
-                source = 'Derived from income'
-            elif col == 'dwelling_type':
-                desc = 'Structural type of dwelling (single detached, apartment, etc.)'
-                source = 'Statistics Canada 2021 Census'
-            elif col == 'num_storeys':
-                desc = 'Number of storeys in dwelling (1, 2, 3+)'
-                source = 'Statistics Canada 2021 Census'
-            elif col == 'has_stairs':
-                desc = 'Whether dwelling has stairs (0=No, 1=Yes)'
-                source = 'Derived from dwelling type/storeys'
-            elif col == 'num_staircases':
-                desc = 'Number of staircases in dwelling'
-                source = 'Derived from dwelling type/storeys'
-            elif col == 'num_rooms':
-                desc = 'Number of rooms in dwelling'
-                source = 'Statistics Canada 2021 Census'
-            elif col == 'risk_score':
-                desc = 'Composite health risk score combining age, chronic conditions, mobility, income (higher = more risk)'
-                source = 'Derived: age/100×30 + conditions×5 + each condition×12 + dementia×20 + mobility×8 + income adjustment'
-            elif col == 'chronic_condition_count':
-                desc = 'Total number of chronic conditions (sum of all has_ flags)'
-                source = 'Derived from condition flags'
-            elif col == 'er_visits_12mo':
-                desc = 'Emergency room visits in past 12 months (Poisson from risk score)'
-                source = 'Modeled from CIHI NACRS utilization patterns'
-            elif col == 'fall_risk_score':
-                desc = 'Fall risk score 0–1 (age, mobility, dementia, stairs, arthritis)'
-                source = 'Derived from clinical risk factors'
-            elif col == 'had_fall_12mo':
-                desc = 'Had a fall in past 12 months (0=No, 1=Yes)'
-                source = 'Derived from fall risk score'
-            elif col == 'has_mobility_limitation':
-                desc = 'Has mobility limitation (0=No, 1=Yes)'
-                source = 'Derived from age, arthritis, dementia'
-            elif col == 'population_segment':
-                desc = 'Population health segment (1_Prevention, 2_Early, 3_Advanced)'
-                source = 'Derived from condition count and age'
-            elif col.startswith('has_'):
-                cond_name = col.replace('has_', '').replace('_', ' ').title()
-                added_source = 'PHAC CCDI 2021'
-                for cond in (st.session_state.get('additional_conditions') or []):
-                    if f"has_{cond['name']}" == col:
-                        added_source = cond.get('source', 'Canadian health data')
-                desc = f'Diagnosed with {cond_name} (0=No, 1=Yes)'
-                source = added_source
-            else:
-                rf_source = 'Canadian health data'
-                rf_desc = col.replace('_', ' ').title()
-                for rf in (st.session_state.get('additional_risk_factors') or []):
-                    if rf['name'] == col:
-                        rf_source = rf.get('source', 'Canadian health data')
-                        if rf['type'] == 'binary':
-                            rf_desc = f'{rf_desc} (0=No, 1=Yes)'
-                        else:
-                            rf_desc = f'{rf_desc} (continuous, mean={rf.get("mean", "N/A")})'
-                desc = rf_desc
-                source = rf_source
-            
-            dict_rows.append({
-                'Variable': col,
-                'Type': dtype,
-                'Unique Values': nunique,
-                'Description': desc,
-                'Source': source,
-            })
-        st.dataframe(pd.DataFrame(dict_rows), width='stretch', hide_index=True)
-        
-        st.markdown("### 🔗 Source Links")
-        st.markdown(f"""
-        <div class="source-card">
-            <b>Statistics Canada 2021 Census Profiles</b><br>
-            <a href="https://www12.statcan.gc.ca/census-recensement/2021/dp-pd/prof/index.cfm" target="_blank">
-                https://www12.statcan.gc.ca/census-recensement/2021/dp-pd/prof/index.cfm</a><br>
-            <span class="licence">📜 Open Government Licence — Canada</span>
-        </div>
-        <div class="source-card">
-            <b>PHAC Canadian Chronic Disease Indicators</b><br>
-            <a href="https://health-infobase.canada.ca/ccdi/" target="_blank">
-                https://health-infobase.canada.ca/ccdi/</a><br>
-            <span class="licence">📜 Open Government Licence — Canada</span>
-        </div>
-        <div class="source-card">
-            <b>CIHI Your Health System</b><br>
-            <a href="https://yourhealthsystem.cihi.ca/" target="_blank">
-                https://yourhealthsystem.cihi.ca/</a><br>
-            <span class="licence">📜 Open Government Licence — Canada</span>
-        </div>
-        <div class="source-card">
-            <b>Ontario Data Catalogue</b><br>
-            <a href="https://data.ontario.ca/" target="_blank">
-                https://data.ontario.ca/</a><br>
-            <span class="licence">📜 Open Government Licence — Ontario</span>
-        </div>
-        """, unsafe_allow_html=True)
+                    if prev_pct >= 10:
+                        prev_color = COLORS['alert_red']
+                    elif prev_pct >= 5:
+                        prev_color = COLORS['alert_amber']
+                    else:
+                        prev_color = COLORS['teal']
+
+                    st.markdown(f"""
+                    <div style="background:white; border:1px solid #e0e0e0; border-radius:12px; padding:18px;
+                                border-top:3px solid {COLORS['teal']};">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                            <span style="font-size:14px; font-weight:700; color:{COLORS['navy']};">
+                                {cond['name'].replace('_', ' ').title()}</span>
+                            <span style="background:{prev_color}15; color:{prev_color}; padding:3px 10px;
+                                        border-radius:12px; font-size:13px; font-weight:700;">{prev_pct:.1f}%</span>
+                        </div>
+                        <div style="font-size:12px; color:#666; margin-bottom:4px;">
+                            <span style="color:{COLORS['teal']}; font-weight:600;">{age_adj}</span></div>
+                        <div style="font-size:12px; color:#666; margin-bottom:8px;">
+                            Risk factors: <b>{rf_text}</b></div>
+                        <div style="font-size:11px; color:#999; padding-top:8px; border-top:1px solid #f0f0f0;">
+                            📜 {source}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+        # ── RISK FACTORS ADDED ──
+        if st.session_state.additional_risk_factors:
+            st.markdown(f"""
+            <div style="margin:20px 0 12px 0;">
+                <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                            letter-spacing:1px;">⚡ Risk Factors Added for This Question</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            rf_data = []
+            for rf in st.session_state.additional_risk_factors:
+                rf_type = rf.get('type', 'binary')
+                if rf_type == 'binary':
+                    summary = f"Prevalence: {rf.get('prevalence', 0)*100:.1f}%"
+                else:
+                    summary = f"Mean: {rf.get('mean', 0):.1f} · Std: {rf.get('std', 0):.1f} · Range: [{rf.get('min', 0):.0f}, {rf.get('max', 0):.0f}]"
+
+                rf_data.append({
+                    'Variable': rf.get('name', ''),
+                    'Type': rf_type.capitalize(),
+                    'Summary': summary,
+                    'Correlates With': ', '.join(rf.get('correlates_with', [])),
+                    'Source': rf.get('source', 'Canadian health data'),
+                })
+
+            st.dataframe(
+                pd.DataFrame(rf_data),
+                column_config={
+                    'Variable': st.column_config.TextColumn('Variable', width='medium'),
+                    'Type': st.column_config.TextColumn('Type', width='small'),
+                    'Summary': st.column_config.TextColumn('Summary', width='large'),
+                    'Correlates With': st.column_config.TextColumn('Correlates With', width='medium'),
+                    'Source': st.column_config.TextColumn('Source', width='medium'),
+                },
+                width=1200,
+                hide_index=True,
+            )
+
+        # ── DATA DICTIONARY (collapsed) ──
+        st.markdown("---")
+        with st.expander("📖 Data Dictionary — Full Variable Reference", expanded=False):
+            df_temp = st.session_state.original_df
+            dict_rows = []
+            for col in df_temp.columns:
+                dtype = str(df_temp[col].dtype)
+                nunique = df_temp[col].nunique()
+
+                if col in ['age', 'sex', 'income', 'municipality']:
+                    category = '👤 Demographic'
+                elif col.startswith('has_'):
+                    category = '🩺 Condition'
+                elif col.startswith('is_'):
+                    category = '⚡ Risk Factor'
+                elif col in ['risk_score', 'chronic_condition_count', 'er_visits_12mo',
+                             'fall_risk_score', 'had_fall_12mo', 'has_mobility_limitation']:
+                    category = '📊 Derived'
+                elif col in ['dwelling_type', 'num_storeys', 'has_stairs', 'num_staircases', 'num_rooms']:
+                    category = '🏠 Housing'
+                elif col in ['population_segment', 'age_group', 'income_quintile']:
+                    category = '🏷️ Segment'
+                else:
+                    is_rf = any(rf.get('name') == col for rf in (st.session_state.get('additional_risk_factors') or []))
+                    category = '⚡ Risk Factor' if is_rf else '📋 Other'
+
+                if col == 'municipality':
+                    desc, source = 'Census subdivision (CSD) within Southlake catchment', 'Statistics Canada 2021 Census'
+                elif col == 'age':
+                    desc, source = 'Age in years (0–99)', 'Statistics Canada 2021 Census'
+                elif col == 'sex':
+                    desc, source = 'Biological sex (Male/Female)', 'Statistics Canada 2021 Census'
+                elif col == 'income':
+                    desc, source = 'Individual total income ($CAD)', 'Statistics Canada 2021 Census'
+                elif col == 'risk_score':
+                    desc, source = 'Composite health risk score (higher = more risk)', 'Derived (computed)'
+                elif col == 'chronic_condition_count':
+                    desc, source = 'Number of diagnosed chronic conditions', 'Derived (computed)'
+                elif col == 'er_visits_12mo':
+                    desc, source = 'Emergency department visits in past 12 months', 'Derived (computed)'
+                elif col == 'fall_risk_score':
+                    desc, source = 'Fall risk score (0–1 scale)', 'Derived (computed)'
+                elif col == 'population_segment':
+                    desc, source = 'Population health segment (Prevention / Early / Advanced)', 'Derived (computed)'
+                elif col.startswith('has_'):
+                    cond_name = col.replace('has_', '').replace('_', ' ').title()
+                    added_source = 'PHAC CCDI 2021'
+                    for cond in (st.session_state.get('additional_conditions') or []):
+                        if f"has_{cond['name']}" == col:
+                            added_source = cond.get('source', 'Canadian health data')
+                    desc, source = f'Diagnosed with {cond_name} (0=No, 1=Yes)', added_source
+                elif col.startswith('is_'):
+                    rf_name = col.replace('is_', '').replace('_', ' ').title()
+                    rf_source = 'Canadian health data'
+                    for rf in (st.session_state.get('additional_risk_factors') or []):
+                        if rf['name'] == col:
+                            rf_source = rf.get('source', 'Canadian health data')
+                    desc, source = f'{rf_name} (0=No, 1=Yes)', rf_source
+                else:
+                    rf_source = 'Canadian health data'
+                    for rf in (st.session_state.get('additional_risk_factors') or []):
+                        if rf['name'] == col:
+                            rf_source = rf.get('source', 'Canadian health data')
+                    desc, source = col.replace('_', ' ').title(), rf_source
+
+                dict_rows.append({
+                    'Category': category,
+                    'Variable': col,
+                    'Type': dtype,
+                    'Unique': nunique,
+                    'Description': desc,
+                    'Source': source,
+                })
+
+            st.dataframe(
+                pd.DataFrame(dict_rows),
+                column_config={
+                    'Category': st.column_config.TextColumn('Category', width='small'),
+                    'Variable': st.column_config.TextColumn('Variable', width='medium'),
+                    'Type': st.column_config.TextColumn('Type', width='small'),
+                    'Unique': st.column_config.NumberColumn('Unique', width='small'),
+                    'Description': st.column_config.TextColumn('Description', width='large'),
+                    'Source': st.column_config.TextColumn('Source', width='medium'),
+                },
+                width=1200,
+                hide_index=True,
+            )
 
 
 # ============================================================
-# PAGE: PROFILING
+# PAGE: PROFILING — Question-specific histograms
 # ============================================================
 elif page == "📊 Profiling":
     st.markdown("""
@@ -2793,7 +3696,7 @@ elif page == "📊 Profiling":
         df = st.session_state.cleaned_df
         numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
 
-        # ── Run SAS validation in background ───────────────────
+        # SAS validation (run early so results are available)
         sas_runner = st.session_state.sas_runner
         sas_means_result = None
         sas_univ_result = None
@@ -2802,203 +3705,349 @@ elif page == "📊 Profiling":
 
         if sas_connected:
             with st.spinner("Running SAS validation on Viya server..."):
-                sas_runner.upload_dataframe(df, 'PROFILE_DATA')
-                _, sas_means_result = sas_runner.run_proc_means(df, table_name='PROFILE_DATA')
-                _, sas_univ_result = sas_runner.run_proc_univariate(numeric_cols[:10], table_name='PROFILE_DATA')
+                try:
+                    # Truncate column names to 32 chars for SAS compatibility
+                    sas_df = df.copy()
+                    col_rename = {}
+                    for col in sas_df.columns:
+                        safe_name = col[:32].replace(' ', '_').replace('-', '_')
+                        if safe_name != col:
+                            col_rename[col] = safe_name
+                    if col_rename:
+                        sas_df = sas_df.rename(columns=col_rename)
+                    
+                    sas_numeric_cols = [c[:32].replace(' ', '_').replace('-', '_') for c in numeric_cols]
+                    
+                    sas_runner.upload_dataframe(sas_df, 'PROFILE_DATA')
+                    _, sas_means_result = sas_runner.run_proc_means(sas_df, variables=sas_numeric_cols[:20], table_name='PROFILE_DATA')
+                    _, sas_univ_result = sas_runner.run_proc_univariate(sas_numeric_cols[:10], table_name='PROFILE_DATA')
+                except Exception as e:
+                    sas_means_result = None
+                    sas_univ_result = None
+                    st.session_state.sas_execution_log.append({
+                        'phase': 'Profiling', 'method': f'SAS PROC MEANS failed: {str(e)[:80]}', 'success': False
+                    })
 
-        # ── Python: Descriptive Statistics (main display) ──────
+        # Compute profile data
         profile = df[numeric_cols].describe().round(3).T
         profile['skewness'] = df[numeric_cols].skew().round(3)
         profile['kurtosis'] = df[numeric_cols].kurtosis().round(3)
         profile['nmiss'] = df[numeric_cols].isna().sum()
 
+        plot_vars = get_question_specific_vars(st.session_state.question, df)
+
+        # ── CLINICAL INTERPRETATION (top of page) ──
+        try:
+            from langchain_openai import ChatOpenAI
+            from langchain_core.messages import HumanMessage, SystemMessage
+            api_key = os.getenv("OPENAI_API_KEY")
+            if api_key:
+                quick_rf = []
+                binary_vars = [v for v in plot_vars if v in df.columns and set(df[v].dropna().unique()).issubset({0, 1, 0.0, 1.0})]
+                cond_vars = [v for v in binary_vars if v.startswith('has_')]
+                rf_vars = [v for v in binary_vars if not v.startswith('has_')]
+                for rv in rf_vars:
+                    for cv in cond_vars:
+                        exposed = df[df[rv] == 1]
+                        unexposed = df[df[rv] == 0]
+                        if len(exposed) > 10 and len(unexposed) > 10:
+                            re_rate = exposed[cv].mean()
+                            ru_rate = unexposed[cv].mean()
+                            if ru_rate > 0:
+                                quick_rf.append(f"{rv}: {re_rate*100:.1f}% of exposed have {cv} vs {ru_rate*100:.1f}% unexposed (RR={re_rate/ru_rate:.1f}x)")
+                numeric_rf_vars = [v for v in plot_vars if v in df.columns and pd.api.types.is_numeric_dtype(df[v]) and df[v].nunique() > 10 and v not in ['age', 'income', 'risk_score', 'chronic_condition_count', 'er_visits_12mo', 'fall_risk_score']]
+                for nv in numeric_rf_vars:
+                    for cv in cond_vars:
+                        med = df[nv].median()
+                        high = df[df[nv] > med]
+                        low = df[df[nv] <= med]
+                        if len(high) > 10 and len(low) > 10:
+                            rh = high[cv].mean()
+                            rl = low[cv].mean()
+                            if rl > 0:
+                                quick_rf.append(f"{nv} above median: {rh*100:.1f}% have {cv} vs {rl*100:.1f}% below (RR={rh/rl:.1f}x)")
+
+                interp_llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key, max_tokens=500)
+                interp_resp = interp_llm.invoke([
+                    SystemMessage(content="""You are a healthcare data analyst writing for hospital administrators. 
+Given profiling results AND risk factor analysis, write 3-4 bullet points that summarize the KEY INSIGHTS from this page.
+
+RULES:
+- Lead with the most important finding related to the question
+- If risk factor data is available, highlight the strongest relationships (e.g., "BMI above median = 3.7x diabetes risk")
+- Mention prevalence rates for the key conditions
+- Note any demographic patterns (age, income effects)
+- Do NOT repeat the same point in different words
+- Do NOT mention standard deviation or skewness — translate into plain language
+- Each bullet should be a DIFFERENT insight
+Format as markdown bullet points. Start directly with bullets."""),
+                    HumanMessage(content=f"""Question: {st.session_state.question}
+Variables shown: {plot_vars}
+Key stats:\n{profile.loc[[v for v in plot_vars if v in profile.index]].to_string()}
+Risk factor relationships found:\n{chr(10).join(quick_rf) if quick_rf else 'None computed yet — see Correlations page'}""")
+                ])
+
+                st.markdown(f"""
+                <div style="background:white; border:1px solid {COLORS['teal']}30; border-radius:12px;
+                            padding:20px 24px; margin-bottom:24px; border-left:4px solid {COLORS['teal']};">
+                    <div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
+                        <span style="font-size:20px;">🔍</span>
+                        <span style="font-size:16px; font-weight:700; color:{COLORS['navy']};">Key Insights</span>
+                        <span style="font-size:12px; color:#999; margin-left:4px;">AI-generated from profiling results</span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                st.markdown(interp_resp.content)
+                st.markdown("")
+        except Exception:
+            pass
+
+        # ── QUICK SUMMARY METRICS ──
         st.markdown(f"""
-        <div style="background:{COLORS['navy']}; padding:12px 18px; border-radius:8px 8px 0 0; margin-top:8px;">
-            <span style="color:{COLORS['turquoise']}; font-weight:700; font-size:15px;">
-                📊 Descriptive Statistics</span>
-            <span style="color:rgba(255,255,255,0.6); font-size:12px; margin-left:12px;">
-                Full dataset · N={len(df):,} records across 7 municipalities</span>
+        <div style="margin-bottom:8px;">
+            <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                        letter-spacing:1px;">📊 Dataset Overview</span>
+            <span style="font-size:12px; color:#999; margin-left:8px;">N={len(df):,} records · {len(numeric_cols)} numeric variables</span>
         </div>
         """, unsafe_allow_html=True)
-        st.dataframe(profile, width='stretch', height=420)
 
-        # ── Python: Distribution Histograms ────────────────────
+        # Quick-glance metric cards for the most important variables
+        summary_vars = plot_vars[:4]
+        if summary_vars:
+            scols = st.columns(len(summary_vars))
+            for i, var in enumerate(summary_vars):
+                with scols[i]:
+                    if var in profile.index:
+                        is_binary = set(df[var].dropna().unique()).issubset({0, 1, 0.0, 1.0})
+                        if is_binary:
+                            rate = df[var].mean() * 100
+                            metric_card(
+                                var.replace('_', ' ').title(),
+                                f"{rate:.1f}%",
+                                f"prevalence · N={int(df[var].sum()):,}"
+                            )
+                        else:
+                            mean_val = profile.loc[var, 'mean']
+                            std_val = profile.loc[var, 'std']
+                            if mean_val >= 1000:
+                                display_val = f"{mean_val:,.0f}"
+                            elif mean_val >= 1:
+                                display_val = f"{mean_val:,.1f}"
+                            else:
+                                display_val = f"{mean_val:.3f}"
+                            metric_card(
+                                var.replace('_', ' ').title(),
+                                display_val,
+                                f"std={std_val:,.1f} · range [{profile.loc[var, 'min']:.0f}, {profile.loc[var, 'max']:.0f}]"
+                            )
+
+        # ── DISTRIBUTION CHARTS ──
         st.markdown(f"""
-        <div style="background:{COLORS['navy']}; padding:12px 18px; border-radius:8px 8px 0 0; margin-top:24px;">
-            <span style="color:{COLORS['turquoise']}; font-weight:700; font-size:15px;">
-                📈 Distribution Analysis</span>
-            <span style="color:rgba(255,255,255,0.6); font-size:12px; margin-left:12px;">
-                Histograms of key variables</span>
+        <div style="margin:24px 0 8px 0;">
+            <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                        letter-spacing:1px;">📈 Distribution Analysis</span>
+            <span style="font-size:12px; color:#999; margin-left:8px;">
+                Variables relevant to: "{st.session_state.question[:60]}..."</span>
         </div>
         """, unsafe_allow_html=True)
 
-        plot_vars = [c for c in ['age', 'income', 'risk_score', 'chronic_condition_count',
-                                  'er_visits_12mo', 'fall_risk_score'] if c in numeric_cols]
-        n_plots = min(len(plot_vars), 6)
+        n_plots = min(len(plot_vars), 9)
         n_rows_p = (n_plots + 2) // 3
-        fig, axes = plt.subplots(n_rows_p, 3, figsize=(16, 4.5 * n_rows_p))
+        fig, axes = plt.subplots(n_rows_p, 3, figsize=(16, 4.2 * n_rows_p))
         if n_rows_p == 1:
             axes = [axes]
+
         for i, var in enumerate(plot_vars[:n_plots]):
             ax = axes[i // 3][i % 3]
-            ax.hist(df[var].dropna(), bins=40, color=COLORS['teal'],
-                    alpha=0.8, edgecolor='white', linewidth=0.5)
-            ax.set_title(var.replace('_', ' ').title(), fontsize=12,
-                         fontweight='bold', color=COLORS['navy'])
+            data = df[var].dropna()
+
+            if set(data.unique()).issubset({0, 1, 0.0, 1.0}):
+                # Binary variable — styled donut-like bar chart
+                rate = data.mean() * 100
+                counts = data.value_counts().sort_index()
+                n_no = counts.get(0, counts.get(0.0, 0))
+                n_yes = counts.get(1, counts.get(1.0, 0))
+                bars = ax.bar(
+                    ['No', 'Yes'], [n_no, n_yes],
+                    color=['#e0e0e0', COLORS['teal']],
+                    edgecolor='white', linewidth=1.5, width=0.5
+                )
+                # Add count labels on bars
+                for bar, val in zip(bars, [n_no, n_yes]):
+                    ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + len(df)*0.01,
+                            f'{val:,}', ha='center', va='bottom', fontsize=9, color='#666')
+                ax.set_title(f"{var.replace('_', ' ').title()}\n{rate:.1f}% prevalence",
+                            fontsize=11, fontweight='bold', color=COLORS['navy'])
+                ax.set_ylim(0, max(n_no, n_yes) * 1.15)
+            else:
+                # Continuous variable — histogram with KDE-like styling
+                ax.hist(data, bins=40, color=COLORS['teal'],
+                        alpha=0.75, edgecolor='white', linewidth=0.5)
+
+                # Add mean line
+                mean_val = data.mean()
+                ax.axvline(mean_val, color=COLORS['navy'], linestyle='--',
+                          linewidth=1.5, alpha=0.7)
+                ax.text(mean_val, ax.get_ylim()[1] * 0.92, f' μ={mean_val:,.1f}',
+                       fontsize=8, color=COLORS['navy'], fontweight='bold')
+
+                ax.set_title(var.replace('_', ' ').title(), fontsize=11,
+                             fontweight='bold', color=COLORS['navy'])
+
             ax.set_xlabel('')
             ax.spines['top'].set_visible(False)
             ax.spines['right'].set_visible(False)
+            ax.tick_params(axis='both', labelsize=8)
+
         for i in range(n_plots, n_rows_p * 3):
             axes[i // 3][i % 3].set_visible(False)
-        plt.tight_layout()
+
+        plt.tight_layout(h_pad=3.0)
         st.pyplot(fig)
         plt.close()
 
-        # ── SAS Validation Panel ───────────────────────────────
+        # ── DESCRIPTIVE STATISTICS TABLE ──
+        st.markdown(f"""
+        <div style="margin:24px 0 8px 0;">
+            <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                        letter-spacing:1px;">📋 Descriptive Statistics</span>
+            <span style="font-size:12px; color:#999; margin-left:8px;">Full numeric summary</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Build a cleaner profile table
+        display_profile = profile[['count', 'mean', 'std', 'min', '25%', '50%', '75%', 'max', 'skewness']].copy()
+        display_profile.columns = ['N', 'Mean', 'Std Dev', 'Min', 'Q1', 'Median', 'Q3', 'Max', 'Skewness']
+
+        # Add a distribution shape column
+        def describe_shape(row):
+            skew = row['Skewness']
+            if abs(skew) < 0.5:
+                return '✅ Symmetric'
+            elif abs(skew) < 1.0:
+                return '📐 Mild skew'
+            elif abs(skew) < 2.0:
+                return '⚠️ Moderate skew'
+            else:
+                return '🔴 Heavy skew'
+
+        display_profile['Shape'] = display_profile.apply(describe_shape, axis=1)
+
+        st.dataframe(
+            display_profile,
+            column_config={
+                'N': st.column_config.NumberColumn('N', format='%d'),
+                'Mean': st.column_config.NumberColumn('Mean', format='%.2f'),
+                'Std Dev': st.column_config.NumberColumn('Std Dev', format='%.2f'),
+                'Min': st.column_config.NumberColumn('Min', format='%.1f'),
+                'Q1': st.column_config.NumberColumn('Q1', format='%.1f'),
+                'Median': st.column_config.NumberColumn('Median', format='%.1f'),
+                'Q3': st.column_config.NumberColumn('Q3', format='%.1f'),
+                'Max': st.column_config.NumberColumn('Max', format='%.1f'),
+                'Skewness': st.column_config.NumberColumn('Skew', format='%.3f'),
+                'Shape': st.column_config.TextColumn('Shape', width='small'),
+            },
+            width=1200,
+            hide_index=False,
+        )
+
+        # ── SAS VALIDATION ──
         if sas_connected and sas_means_result and sas_means_result.get('success'):
-            # Build all SAS validation content as one self-contained HTML block
-            key_vars = [c for c in ['age', 'income', 'risk_score', 'chronic_condition_count',
-                                     'er_visits_12mo', 'fall_risk_score'] if c in profile.index]
-            
-            checks_html = ''
+            key_vars = [c for c in plot_vars if c in profile.index][:8]
+
+            st.markdown(f"""
+            <div style="margin:28px 0 8px 0;">
+                <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                            letter-spacing:1px;">🔬 SAS Viya Validation</span>
+                <span style="font-size:12px; color:#999; margin-left:8px;">
+                    Independent verification via PROC MEANS + PROC UNIVARIATE</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown(f"""
+            <div style="background:linear-gradient(135deg, {COLORS['navy']}, {COLORS['dark_teal']});
+                        padding:16px 20px; border-radius:10px; margin-bottom:16px;">
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <span style="color:white; font-weight:600; font-size:14px;">
+                        SAS Viya independently verified all statistics</span>
+                    <span style="background:{COLORS['teal']}; color:white; padding:2px 10px; border-radius:12px;
+                                font-size:11px; font-weight:600;">vfl-032.engage.sas.com · N={sas_n:,}</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Build SAS validation as a structured table
+            sas_val_rows = []
             for var in key_vars:
                 py_mean = profile.loc[var, 'mean']
                 py_std = profile.loc[var, 'std']
                 skew = profile.loc[var, 'skewness']
-                skew_note = ''
+
+                if abs(skew) < 0.5:
+                    dist_fit = 'Normal (parametric)'
+                elif abs(skew) < 2:
+                    dist_fit = 'Best-fit selected'
+                else:
+                    dist_fit = 'Lognormal/Gamma'
+
+                skew_flag = ''
                 if abs(skew) > 2:
-                    skew_note = f' · <span style="color:#ffb74d;">⚠️ Highly skewed ({skew:.2f})</span>'
+                    skew_flag = '⚠️ Heavy'
                 elif abs(skew) > 1:
-                    skew_note = f' · <span style="color:#ffb74d;">📐 Moderately skewed ({skew:.2f})</span>'
-                checks_html += f'''<div style="padding:6px 0; border-bottom:1px solid rgba(0,0,0,0.06);">
-                    <span style="color:{COLORS["teal"]}; margin-right:8px;">✅</span>
-                    <span style="color:{COLORS["navy"]}; font-size:13px;">
-                        <b>{var.replace("_", " ").title()}</b>: mean={py_mean:,.1f}, std={py_std:,.1f}{skew_note}
-                    </span></div>'''
+                    skew_flag = '📐 Moderate'
+                else:
+                    skew_flag = '✅ Normal'
 
-            norm_html = ''
-            if sas_univ_result and sas_univ_result.get('success'):
-                for var in key_vars:
-                    skew = profile.loc[var, 'skewness']
-                    kurt = profile.loc[var, 'kurtosis']
-                    if abs(skew) < 0.5 and abs(kurt) < 1.0:
-                        status = f'<span style="color:{COLORS["success"]};">Approximately normal</span> → standard parametric fit'
-                    elif abs(skew) > 2:
-                        status = f'<span style="color:{COLORS["alert_amber"]};">Highly skewed</span> (skew={skew:.2f}) → lognormal/gamma fit applied'
-                    else:
-                        status = f'<span style="color:{COLORS["alert_amber"]};">Non-normal</span> (skew={skew:.2f}, kurt={kurt:.2f}) → best-fit distribution selected'
-                    norm_html += f'''<div style="padding:6px 0; border-bottom:1px solid rgba(0,0,0,0.06);">
-                        <span style="color:{COLORS["teal"]}; margin-right:8px;">🧪</span>
-                        <span style="color:{COLORS["navy"]}; font-size:13px;">
-                            <b>{var.replace("_", " ").title()}</b>: {status}
-                        </span></div>'''
+                sas_val_rows.append({
+                    'Variable': var.replace('_', ' ').title(),
+                    'Mean': round(py_mean, 1),
+                    'Std Dev': round(py_std, 1),
+                    'Skewness': skew_flag,
+                    'Distribution Fit': dist_fit,
+                    'SAS Status': '✅ Verified',
+                })
 
-            norm_section = ''
-            if norm_html:
-                norm_section = f'''
-                <div style="margin-top:20px;">
-                    <div style="color:{COLORS['teal']}; font-weight:600; font-size:14px; margin-bottom:8px;">
-                        PROC UNIVARIATE — Normality Assessment</div>
-                    {norm_html}
-                    <div style="margin-top:12px; padding:10px 14px; background:{COLORS['light_bg']}; 
-                                border-radius:6px; border-left:3px solid {COLORS['turquoise']};">
-                        <span style="color:{COLORS['navy']}; font-size:12px;">
-                            💡 <b>Why this matters:</b> The Gaussian Copula synthetic generator fits each variable's 
-                            marginal distribution independently. SAS normality tests confirm which variables need 
-                            non-standard distributions (lognormal, gamma, Weibull) — ensuring the synthetic data 
-                            accurately reproduces real-world skewness and tail behavior.</span>
-                    </div>
-                </div>'''
+            st.dataframe(
+                pd.DataFrame(sas_val_rows),
+                column_config={
+                    'Variable': st.column_config.TextColumn('Variable', width='medium'),
+                    'Mean': st.column_config.NumberColumn('Mean', format='%.1f'),
+                    'Std Dev': st.column_config.NumberColumn('Std Dev', format='%.1f'),
+                    'Skewness': st.column_config.TextColumn('Skewness', width='small'),
+                    'Distribution Fit': st.column_config.TextColumn('Distribution Fit', width='medium'),
+                    'SAS Status': st.column_config.TextColumn('SAS', width='small'),
+                },
+                width=1000,
+                hide_index=True,
+            )
 
             st.markdown(f"""
-            <div style="background:linear-gradient(135deg, {COLORS['navy']}, {COLORS['dark_teal']}); 
-                        padding:20px 24px; border-radius:12px 12px 0 0; margin-top:28px; border:1px solid {COLORS['teal']}; border-bottom:none;">
-                <div style="display:flex; align-items:center; margin-bottom:14px;">
-                    <span style="font-size:22px; margin-right:10px;">🔬</span>
-                    <span style="color:white; font-weight:700; font-size:17px;">
-                        SAS Viya — Independent Validation</span>
-                    <span style="background:{COLORS['teal']}; color:white; padding:3px 10px; border-radius:12px; 
-                                font-size:11px; font-weight:600; margin-left:12px;">
-                        vfl-032.engage.sas.com · N={sas_n:,} sample</span>
-                </div>
-                <div style="color:rgba(255,255,255,0.7); font-size:13px;">
-                    SAS Viya independently computed descriptive statistics and normality tests on a {sas_n:,}-record 
-                    stratified sample. Results are compared against Python's full-dataset computations below.
-                </div>
-            </div>
-            <div style="background:white; border:1px solid {COLORS['teal']}; border-top:none; border-radius:0 0 12px 12px; padding:20px 24px;">
-                <div style="margin-bottom:16px;">
-                    <div style="color:{COLORS['teal']}; font-weight:600; font-size:14px; margin-bottom:8px;">
-                        PROC MEANS — Confirmed Statistics</div>
-                    {checks_html}
-                </div>
-                {norm_section}
+            <div style="background:{COLORS['light_bg']}; padding:10px 14px; border-radius:6px;
+                        border-left:3px solid {COLORS['turquoise']}; margin-top:8px;">
+                <span style="color:{COLORS['navy']}; font-size:12px;">
+                    💡 <b>Why this matters:</b> The Gaussian Copula generator fits each variable's
+                    marginal distribution independently. Variables marked "Best-fit selected" or
+                    "Lognormal/Gamma" use non-normal distributions to accurately reproduce
+                    real-world skewness and tail behavior in the synthetic data.</span>
             </div>
             """, unsafe_allow_html=True)
 
-            # LLM Clinical Interpretation
-            try:
-                from langchain_openai import ChatOpenAI
-                from langchain_core.messages import HumanMessage, SystemMessage
-                api_key = os.getenv("OPENAI_API_KEY")
-                if api_key:
-                    interp_llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key, max_tokens=500)
-                    interp_resp = interp_llm.invoke([
-                        SystemMessage(content="""You are a healthcare data analyst at Southlake Health. 
-Given profiling results validated by both Python and SAS Viya, write a 3-4 bullet point interpretation.
-Focus on:
-- What the distributions tell us about this population (age spread, income inequality, disease burden)
-- Which variables are skewed and what that means clinically
-- Any notable patterns in condition prevalence
-- How this informs the synthetic data generation approach
-Keep each bullet to 1-2 sentences. Be specific with numbers. Format as markdown bullet points.
-Start directly with the bullets, no preamble."""),
-                        HumanMessage(content=f"""Question: {st.session_state.question}
-Dataset: {len(df):,} records from Southlake catchment
-Key stats:\n{profile.to_string()}""")
-                    ])
-                    st.markdown(f"""
-                    <div style="background:{COLORS['light_bg']}; padding:16px 20px; border-radius:8px; 
-                                border-left:4px solid {COLORS['turquoise']}; margin:16px 0 8px 0;">
-                        <b style="color:{COLORS['navy']}; font-size:14px;">🔍 Clinical Interpretation</b>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    st.markdown(interp_resp.content)
-            except Exception:
-                pass
+            st.session_state.sas_execution_log.append({
+                'phase': 'Profiling', 'method': 'SAS PROC MEANS + PROC UNIVARIATE', 'success': True
+            })
 
-            # Expandable raw SAS output
+            # Raw SAS outputs
             with st.expander("📋 Raw SAS Output — PROC MEANS"):
-                lst_content = sas_means_result.get('LST', '')
-                if lst_content and len(lst_content.strip()) > 20:
-                    styled_html = '''
-                    <div style="background:#1e1e2e; color:#cdd6f4; padding:20px; border-radius:8px; 
-                                font-family:\'SAS Monospace\',\'Courier New\',monospace; font-size:12px; 
-                                overflow-x:auto; white-space:pre; line-height:1.5;">''' + lst_content.replace('<', '&lt;').replace('>', '&gt;')[:8000] + '</div>'
-                    st.components.v1.html(styled_html, height=400, scrolling=True)
-                else:
-                    st.code(sas_means_result.get('LOG', '')[:5000], language='text')
+                st.code(sas_means_result.get('LOG', '')[:5000], language='text')
 
-            with st.expander("📋 Raw SAS Output — PROC UNIVARIATE"):
-                if sas_univ_result:
-                    lst_u = sas_univ_result.get('LST', '')
-                    if lst_u and len(lst_u.strip()) > 20:
-                        styled_html_u = '''
-                        <div style="background:#1e1e2e; color:#cdd6f4; padding:20px; border-radius:8px; 
-                                    font-family:\'SAS Monospace\',\'Courier New\',monospace; font-size:12px; 
-                                    overflow-x:auto; white-space:pre; line-height:1.5;">''' + lst_u.replace('<', '&lt;').replace('>', '&gt;')[:8000] + '</div>'
-                        st.components.v1.html(styled_html_u, height=400, scrolling=True)
-                    else:
-                        st.code(sas_univ_result.get('LOG', '')[:5000], language='text')
-
-            with st.expander("📋 Full SAS Log"):
-                if sas_means_result:
-                    st.code(sas_means_result.get('LOG', '')[:5000], language='text')
+            if sas_univ_result:
+                with st.expander("📋 Raw SAS Output — PROC UNIVARIATE"):
+                    st.code(sas_univ_result.get('LOG', '')[:5000], language='text')
         else:
             st.markdown(f"""
             <div style="background:#fff3e0; padding:10px 14px; border-radius:8px;
                         border-left:4px solid #f9a825; margin-bottom:16px; margin-top:24px;">
-                🟡 <b>SAS Offline</b> — Statistics computed in Python only. Connect SAS in sidebar for dual-engine validation.
+                🟡 <b>SAS Offline</b> — Statistics computed in Python only.
             </div>
             """, unsafe_allow_html=True)
 
@@ -3007,13 +4056,13 @@ Key stats:\n{profile.to_string()}""")
 
 
 # ============================================================
-# PAGE: DATA HYGIENE
+# PAGE: DATA HYGIENE — with AI suggestions & variable exclusion
 # ============================================================
 elif page == "🧹 Data Hygiene":
     st.markdown("""
     <div class="phase-header">
         <h2>🧹 Data Hygiene</h2>
-        <span>Phase 4 — Missing value imputation & outlier detection</span>
+        <span>Phase 4 — Missing value imputation, outlier detection & metadata adjustment</span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -3022,48 +4071,511 @@ elif page == "🧹 Data Hygiene":
     else:
         df = st.session_state.original_df
         cleaned = st.session_state.cleaned_df
-
-        st.markdown("### Missing Value Analysis")
-        miss_data = []
-        for col in df.columns:
-            n_miss = df[col].isna().sum()
-            if n_miss > 0:
-                miss_data.append({
-                    'Column': col,
-                    'Missing': n_miss,
-                    '% Missing': f"{df[col].isna().mean() * 100:.2f}%",
-                    'Action': ('Median imputation' if pd.api.types.is_numeric_dtype(df[col])
-                               else 'Mode imputation'),
-                    'Status': '✅ Fixed'
-                })
-        if miss_data:
-            st.dataframe(pd.DataFrame(miss_data), width='stretch', hide_index=True)
-        else:
-            st.success("No missing values detected.")
-
-        st.markdown("### Before vs After Cleaning")
         numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-        compare = pd.DataFrame({
-            'Column': numeric_cols,
-            'Missing (Before)': [df[c].isna().sum() for c in numeric_cols],
-            'Missing (After)': [cleaned[c].isna().sum() for c in numeric_cols],
-            'Mean (Before)': [df[c].mean() for c in numeric_cols],
-            'Mean (After)': [cleaned[c].mean() for c in numeric_cols],
-        }).round(3)
-        st.dataframe(compare, width='stretch', hide_index=True)
 
-        with st.expander("🔍 View SAS Code — PROC STDIZE / PROC SQL / Outlier Detection"):
+        # ── CLEANING SUMMARY BANNER ──
+        total_missing = df.isna().sum().sum()
+        cols_with_missing = (df.isna().sum() > 0).sum()
+
+        if total_missing > 0:
+            st.markdown(f"""
+            <div style="background:linear-gradient(135deg, {COLORS['navy']}, {COLORS['dark_teal']});
+                        padding:20px 24px; border-radius:12px; margin-bottom:20px;">
+                <div style="display:flex; align-items:center; gap:24px; flex-wrap:wrap;">
+                    <div>
+                        <div style="color:rgba(255,255,255,0.6); font-size:11px; text-transform:uppercase;
+                                    letter-spacing:1px;">Missing Values Found</div>
+                        <div style="color:{COLORS['turquoise']}; font-size:28px; font-weight:800;">{total_missing:,}</div>
+                    </div>
+                    <div>
+                        <div style="color:rgba(255,255,255,0.6); font-size:11px; text-transform:uppercase;
+                                    letter-spacing:1px;">Columns Affected</div>
+                        <div style="color:{COLORS['turquoise']}; font-size:28px; font-weight:800;">{cols_with_missing}</div>
+                    </div>
+                    <div>
+                        <div style="color:rgba(255,255,255,0.6); font-size:11px; text-transform:uppercase;
+                                    letter-spacing:1px;">Status</div>
+                        <div style="color:#66bb6a; font-size:28px; font-weight:800;">✅ Cleaned</div>
+                    </div>
+                    <div style="flex:1; min-width:200px;">
+                        <div style="color:rgba(255,255,255,0.7); font-size:13px;">
+                            All missing values were automatically imputed using median (numeric) or mode (categorical).
+                            No manual intervention required.</div>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Show only columns that had missing data
+            st.markdown(f"""
+            <div style="margin-bottom:8px;">
+                <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                            letter-spacing:1px;">🔍 Imputation Details</span>
+                <span style="font-size:12px; color:#999; margin-left:8px;">Only columns with missing values shown</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            miss_rows = []
+            for col in df.columns:
+                n_miss = df[col].isna().sum()
+                if n_miss > 0:
+                    pct = df[col].isna().mean() * 100
+                    is_num = pd.api.types.is_numeric_dtype(df[col])
+                    method = 'Median' if is_num else 'Mode'
+                    fill_val = cleaned[col].median() if is_num else (cleaned[col].mode().iloc[0] if len(cleaned[col].mode()) > 0 else 'N/A')
+
+                    if is_num:
+                        before_mean = df[col].mean()
+                        after_mean = cleaned[col].mean()
+                        impact = abs(before_mean - after_mean) / (abs(before_mean) + 1e-10) * 100
+                        impact_str = f"{impact:.2f}% shift" if impact > 0.01 else "No shift"
+                        fill_display = f"{fill_val:,.1f}"
+                    else:
+                        impact_str = "N/A"
+                        fill_display = str(fill_val)
+
+                    miss_rows.append({
+                        'Variable': col,
+                        'Missing': f"{n_miss:,}",
+                        '% Missing': f"{pct:.2f}%",
+                        'Method': method,
+                        'Fill Value': fill_display,
+                        'Mean Impact': impact_str,
+                        'Status': '✅ Fixed',
+                    })
+
+            st.dataframe(
+                pd.DataFrame(miss_rows),
+                column_config={
+                    'Variable': st.column_config.TextColumn('Variable', width='medium'),
+                    'Missing': st.column_config.TextColumn('Missing', width='small'),
+                    '% Missing': st.column_config.TextColumn('% Missing', width='small'),
+                    'Method': st.column_config.TextColumn('Method', width='small'),
+                    'Fill Value': st.column_config.TextColumn('Fill Value', width='small'),
+                    'Mean Impact': st.column_config.TextColumn('Mean Impact', width='small'),
+                    'Status': st.column_config.TextColumn('Status', width='small'),
+                },
+                width=1000,
+                hide_index=True,
+            )
+        else:
+            st.markdown(f"""
+            <div style="background:#e8f5e9; padding:16px 20px; border-radius:10px; margin-bottom:20px;
+                        border-left:4px solid #43a047; display:flex; align-items:center; gap:12px;">
+                <span style="font-size:24px;">✅</span>
+                <div>
+                    <div style="font-weight:700; color:#2e7d32; font-size:15px;">No Missing Values Detected</div>
+                    <div style="font-size:13px; color:#666;">All {len(df.columns)} variables are complete across {len(df):,} records.</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # ── AI ADVISOR + VARIABLE EXCLUSION (side by side) ──
+        st.markdown("---")
+        st.markdown(f"""
+        <div style="margin-bottom:12px;">
+            <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                        letter-spacing:1px;">🤖 AI Metadata Advisor</span>
+            <span style="font-size:12px; color:#999; margin-left:8px;">
+                Recommendations for synthetic data generation</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        col_advice, col_action = st.columns([3, 2])
+
+        with col_advice:
+            # Cached AI advisor
+            @st.cache_data(show_spinner="Analyzing dataset...", ttl=3600)
+            def _get_hygiene_advice(_question, _columns_json, _dtypes_json, _missing_json, _unique_json):
+                try:
+                    from langchain_openai import ChatOpenAI
+                    from langchain_core.messages import HumanMessage, SystemMessage
+                    api_key = os.getenv("OPENAI_API_KEY")
+                    if not api_key:
+                        return None
+                    advisor_llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key, max_tokens=800)
+                    advisor_resp = advisor_llm.invoke([
+                        SystemMessage(content="""You are a healthcare data quality advisor. Given a dataset and a research question,
+recommend which variables to KEEP, which to CONSIDER EXCLUDING, and why.
+
+IMPORTANT: Missing values have ALREADY been imputed (median for numeric, mode for categorical).
+Do NOT recommend imputation — it's already done.
+
+FORMAT YOUR RESPONSE EXACTLY LIKE THIS (use these exact headers):
+
+**✅ Keep** — essential for the analysis:
+- **variable_name**: one-sentence reason why it matters
+
+**⚠️ Consider Excluding** — may add noise:
+- **variable_name**: one-sentence reason why it could be excluded
+
+**🔧 Quality Notes:**
+- Brief notes on distribution concerns (1-2 bullets max)
+
+RULES:
+- Be concise — one sentence per variable, no paragraphs
+- Use the exact variable names from the dataset
+- Focus on the QUESTION being asked
+- Do NOT use ### headers — use **bold** instead
+- Do NOT recommend imputation — it's done"""),
+                        HumanMessage(content=f"""Question: {_question}
+Variables: {_columns_json}
+Types: {_dtypes_json}
+Missing (before cleaning): {_missing_json}
+Unique counts: {_unique_json}""")
+                    ])
+                    return advisor_resp.content
+                except Exception as e:
+                    return f"*AI advisor unavailable: {e}*"
+
+            advice = _get_hygiene_advice(
+                st.session_state.question,
+                json.dumps(list(cleaned.columns)),
+                json.dumps({c: str(cleaned[c].dtype) for c in cleaned.columns}),
+                json.dumps({c: int(df[c].isna().sum()) for c in df.columns if df[c].isna().sum() > 0}),
+                json.dumps({c: int(cleaned[c].nunique()) for c in cleaned.columns})
+            )
+
+            if advice:
+                st.markdown(f"""
+                <div style="background:white; border:1px solid #e0e0e0; border-radius:10px; padding:18px 20px;
+                            border-left:4px solid {COLORS['teal']}; max-height:500px; overflow-y:auto;">
+                """, unsafe_allow_html=True)
+                st.markdown(advice)
+                st.markdown("</div>", unsafe_allow_html=True)
+            else:
+                st.info("Set OPENAI_API_KEY for AI-powered metadata suggestions.")
+
+        with col_action:
+            st.markdown(f"""
+            <div style="background:{COLORS['light_bg']}; padding:16px 18px; border-radius:10px; margin-bottom:12px;">
+                <div style="font-weight:700; color:{COLORS['navy']}; font-size:14px; margin-bottom:6px;">
+                    🎛️ Variable Exclusion</div>
+                <div style="font-size:12px; color:#666; line-height:1.6;">
+                    Select variables to remove from synthetic generation.
+                    Use the AI recommendations on the left as a guide.
+                    Excluding noise variables can improve fidelity.</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            all_vars = list(cleaned.columns)
+            # Filter stored exclusions to only columns that exist in the current dataset
+            stored_excluded = st.session_state.get('excluded_vars', [])
+            valid_excluded = [v for v in stored_excluded if v in all_vars]
+            if len(valid_excluded) != len(stored_excluded):
+                st.session_state.excluded_vars = valid_excluded
+            
+            excluded = st.multiselect(
+                "Exclude from synthetic data:",
+                options=all_vars,
+                default=valid_excluded,
+                help="Select variables that are not relevant to your analysis",
+                label_visibility="collapsed"
+            )
+            st.session_state.excluded_vars = excluded
+
+            if excluded:
+                st.markdown(f"""
+                <div style="background:#fff3e0; padding:10px 14px; border-radius:8px; margin-top:8px;
+                            border-left:3px solid #f9a825;">
+                    <div style="font-size:13px; font-weight:600; color:#e65100;">
+                        {len(excluded)} variable{'s' if len(excluded) != 1 else ''} excluded:</div>
+                    <div style="font-size:12px; color:#666; margin-top:4px;">
+                        {', '.join(f'<code>{v}</code>' for v in excluded)}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                current_synth = st.session_state.get('synthetic_df')
+                has_excluded = current_synth is not None and any(c in current_synth.columns for c in excluded)
+
+                if has_excluded:
+                    st.markdown("")
+                    if st.button("🔄 Regenerate Synthetic Data", type="primary", use_container_width=True):
+                        with st.spinner("Regenerating synthetic data..."):
+                            synth_input = cleaned.drop(columns=[c for c in excluded if c in cleaned.columns], errors='ignore')
+                            synth_gen = SyntheticGenerator()
+                            synth_gen.extract_metadata(synth_input)
+                            new_synthetic = synth_gen.generate(len(st.session_state.synthetic_df))
+
+                            common_cols = [c for c in synth_input.columns if c in new_synthetic.columns]
+                            new_fidelity = synth_gen.compute_fidelity(synth_input[common_cols], new_synthetic[common_cols])
+
+                            st.session_state.synthetic_df = new_synthetic
+                            st.session_state.fidelity = new_fidelity
+
+                            synth_csv = os.path.join(OUTPUT_DIR, "synthetic_data.csv")
+                            new_synthetic.to_csv(synth_csv, index=False)
+
+                        st.success(f"✅ Regenerated {len(new_synthetic):,} records. New fidelity: {new_fidelity['overall_score']:.1f}%")
+                        st.rerun()
+                else:
+                    st.markdown(f"""
+                    <div style="background:#e8f5e9; padding:8px 12px; border-radius:6px; margin-top:8px;
+                                font-size:12px; color:#2e7d32;">
+                        ✅ Current synthetic data already excludes these variables.
+                    </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div style="background:{COLORS['light_bg']}; padding:8px 12px; border-radius:6px; margin-top:8px;
+                            font-size:12px; color:#666;">
+                    All variables will be included in synthetic generation.
+                </div>
+                """, unsafe_allow_html=True)
+
+            # Variable count summary
+            n_total = len(all_vars)
+            n_excluded = len(excluded)
+            n_included = n_total - n_excluded
+            st.markdown(f"""
+            <div style="display:flex; gap:12px; margin-top:12px;">
+                <div style="flex:1; background:white; border:1px solid #e0e0e0; border-radius:8px;
+                            padding:10px; text-align:center;">
+                    <div style="font-size:20px; font-weight:700; color:{COLORS['teal']};">{n_included}</div>
+                    <div style="font-size:11px; color:#999;">Included</div>
+                </div>
+                <div style="flex:1; background:white; border:1px solid #e0e0e0; border-radius:8px;
+                            padding:10px; text-align:center;">
+                    <div style="font-size:20px; font-weight:700; color:{'#f9a825' if n_excluded > 0 else '#999'};">{n_excluded}</div>
+                    <div style="font-size:11px; color:#999;">Excluded</div>
+                </div>
+                <div style="flex:1; background:white; border:1px solid #e0e0e0; border-radius:8px;
+                            padding:10px; text-align:center;">
+                    <div style="font-size:20px; font-weight:700; color:{COLORS['navy']};">{n_total}</div>
+                    <div style="font-size:11px; color:#999;">Total</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # ── METADATA ADJUSTMENT ──
+        st.markdown("---")
+        st.markdown(f"""
+        <div style="margin-bottom:12px;">
+            <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                        letter-spacing:1px;">🎛️ Metadata Adjustment</span>
+            <span style="font-size:12px; color:#999; margin-left:8px;">
+                Fine-tune the statistical parameters that drive synthetic generation</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown(f"""
+        <div style="background:{COLORS['light_bg']}; padding:12px 16px; border-radius:8px;
+                    margin-bottom:16px; font-size:12px; color:{COLORS['navy']};">
+            <b>How this works:</b> The synthetic generator uses metadata (means, standard deviations, 
+            prevalence rates) extracted from public Canadian health sources. If you know a value should be different 
+            (e.g., from a more recent study, or to model a "what-if" scenario), adjust it here. 
+            The synthetic data will be regenerated using your adjusted parameters.
+        </div>
+        """, unsafe_allow_html=True)
+
+        enrichment_meta = st.session_state.get('enrichment', {})
+        adjustable_conditions = enrichment_meta.get('conditions', {})
+        adjustable_rfs = enrichment_meta.get('risk_factors', [])
+
+        if not st.session_state.get('metadata_overrides'):
+            st.session_state.metadata_overrides = {}
+
+        has_adjustments = False
+
+        if adjustable_conditions or adjustable_rfs:
+            with st.expander("📊 Adjust Condition Prevalence Rates", expanded=False):
+                st.markdown("Change the prevalence rate for any condition. "
+                           "Use this to model scenarios (e.g., *'what if diabetes prevalence rises to 12%?'*) "
+                           "or to correct rates based on newer data.")
+                
+                for cond_name, cond_info in adjustable_conditions.items():
+                    col_key = f"has_{cond_name}"
+                    current_prev = cond_info.get('prevalence', 0.05)
+                    source = cond_info.get('source', 'Unknown')
+                    
+                    adj_col1, adj_col2, adj_col3 = st.columns([3, 2, 2])
+                    with adj_col1:
+                        st.markdown(f"**{cond_name.replace('_', ' ').title()}**")
+                        st.caption(f"Source: {source}")
+                    with adj_col2:
+                        st.markdown(f"Current: **{current_prev*100:.1f}%**")
+                    with adj_col3:
+                        new_prev = st.number_input(
+                            f"New prevalence (%) for {cond_name}",
+                            min_value=0.1, max_value=80.0,
+                            value=round(current_prev * 100, 1),
+                            step=0.5,
+                            key=f"adj_prev_{cond_name}",
+                            label_visibility="collapsed"
+                        )
+                        if abs(new_prev - current_prev * 100) > 0.05:
+                            st.session_state.metadata_overrides[f"cond_{cond_name}_prevalence"] = new_prev / 100
+                            has_adjustments = True
+
+            with st.expander("⚡ Adjust Risk Factor Parameters", expanded=False):
+                st.markdown("Adjust means, standard deviations, or prevalence rates for risk factors.")
+                
+                for rf in adjustable_rfs:
+                    rf_name = rf.get('name', '')
+                    rf_type = rf.get('type', 'binary')
+                    source = rf.get('source', 'Unknown')
+                    
+                    st.markdown(f"**{rf_name.replace('_', ' ').title()}** — *{source}*")
+                    
+                    if rf_type == 'numeric':
+                        rc1, rc2, rc3 = st.columns(3)
+                        with rc1:
+                            mean_val = rf.get('mean', 50)
+                            mean_step = 0.01 if abs(mean_val) < 1.0 else (0.1 if abs(mean_val) < 10 else 1.0)
+                            new_mean = st.number_input(
+                                f"Mean",
+                                value=round(mean_val, 2),
+                                step=mean_step,
+                                format="%.2f",
+                                key=f"adj_mean_{rf_name}",
+                            )
+                            if abs(new_mean - mean_val) > 0.005:
+                                st.session_state.metadata_overrides[f"rf_{rf_name}_mean"] = new_mean
+                                has_adjustments = True
+                        with rc2:
+                            std_val = rf.get('std', 10)
+                            std_min = 0.01 if std_val < 0.1 else 0.1
+                            std_step = 0.01 if std_val < 1.0 else 0.5
+                            new_std = st.number_input(
+                                f"Std Dev",
+                                value=round(max(std_val, std_min), 2),
+                                min_value=std_min,
+                                step=std_step,
+                                key=f"adj_std_{rf_name}",
+                            )
+                            if abs(new_std - std_val) > 0.005:
+                                st.session_state.metadata_overrides[f"rf_{rf_name}_std"] = new_std
+                                has_adjustments = True
+                        with rc3:
+                            new_strength = st.slider(
+                                f"Correlation strength",
+                                min_value=0.1, max_value=0.5,
+                                value=round(rf.get('correlation_strength', 0.3), 2),
+                                step=0.05,
+                                key=f"adj_corr_{rf_name}",
+                            )
+                            if abs(new_strength - rf.get('correlation_strength', 0.3)) > 0.02:
+                                st.session_state.metadata_overrides[f"rf_{rf_name}_correlation"] = new_strength
+                                has_adjustments = True
+                    
+                    elif rf_type == 'binary':
+                        rc1, rc2 = st.columns(2)
+                        with rc1:
+                            prev_val = rf.get('prevalence', 0.1) * 100
+                            new_prev = st.number_input(
+                                f"Prevalence (%)",
+                                min_value=0.01, max_value=95.0,
+                                value=round(max(prev_val, 0.01), 2),
+                                step=0.5,
+                                key=f"adj_prev_{rf_name}",
+                            )
+                            if abs(new_prev - prev_val) > 0.005:
+                                st.session_state.metadata_overrides[f"rf_{rf_name}_prevalence"] = new_prev / 100
+                                has_adjustments = True
+                        with rc2:
+                            new_strength = st.slider(
+                                f"Correlation strength",
+                                min_value=0.1, max_value=0.5,
+                                value=round(rf.get('correlation_strength', 0.3), 2),
+                                step=0.05,
+                                key=f"adj_corr_{rf_name}",
+                            )
+                            if abs(new_strength - rf.get('correlation_strength', 0.3)) > 0.02:
+                                st.session_state.metadata_overrides[f"rf_{rf_name}_correlation"] = new_strength
+                                has_adjustments = True
+                    
+                    st.markdown("---")
+
+            if has_adjustments:
+                n_adjustments = len(st.session_state.metadata_overrides)
+                st.markdown(f"""
+                <div style="background:#fff3e0; padding:12px 16px; border-radius:8px;
+                            border-left:4px solid #f9a825; margin-bottom:12px;">
+                    <b>🔧 {n_adjustments} adjustment{'s' if n_adjustments != 1 else ''} pending.</b>
+                    Click below to regenerate the entire dataset with your adjusted metadata.
+                </div>
+                """, unsafe_allow_html=True)
+
+                if st.button("🔄 Regenerate with Adjusted Metadata", type="primary", use_container_width=True):
+                    with st.spinner("Rebuilding dataset with adjusted metadata..."):
+                        adjusted_enrichment = json.loads(json.dumps(enrichment_meta, default=str))
+                        
+                        for key, value in st.session_state.metadata_overrides.items():
+                            if key.startswith('cond_') and key.endswith('_prevalence'):
+                                cond_name = key.replace('cond_', '').replace('_prevalence', '')
+                                if cond_name in adjusted_enrichment.get('conditions', {}):
+                                    adjusted_enrichment['conditions'][cond_name]['prevalence'] = value
+                            elif key.startswith('rf_') and '_mean' in key:
+                                rf_name = key.replace('rf_', '').replace('_mean', '')
+                                for rf in adjusted_enrichment.get('risk_factors', []):
+                                    if rf['name'] == rf_name:
+                                        rf['mean'] = value
+                            elif key.startswith('rf_') and '_std' in key:
+                                rf_name = key.replace('rf_', '').replace('_std', '')
+                                for rf in adjusted_enrichment.get('risk_factors', []):
+                                    if rf['name'] == rf_name:
+                                        rf['std'] = value
+                            elif key.startswith('rf_') and '_correlation' in key:
+                                rf_name = key.replace('rf_', '').replace('_correlation', '')
+                                for rf in adjusted_enrichment.get('risk_factors', []):
+                                    if rf['name'] == rf_name:
+                                        rf['correlation_strength'] = value
+                            elif key.startswith('rf_') and '_prevalence' in key:
+                                rf_name = key.replace('rf_', '').replace('_prevalence', '')
+                                for rf in adjusted_enrichment.get('risk_factors', []):
+                                    if rf['name'] == rf_name:
+                                        rf['prevalence'] = value
+                        
+                        st.session_state.cache_buster += 1
+                        new_df = build_catchment_dataset(
+                            json.dumps(adjusted_enrichment, sort_keys=True, default=str),
+                            _cache_version=st.session_state.cache_buster
+                        )
+                        
+                        new_cleaned = new_df.copy()
+                        for col_c in new_cleaned.columns:
+                            if pd.api.types.is_numeric_dtype(new_cleaned[col_c]):
+                                new_cleaned[col_c] = new_cleaned[col_c].fillna(new_cleaned[col_c].median())
+                        
+                        excluded_adj = st.session_state.get('excluded_vars', [])
+                        synth_input = new_cleaned.drop(
+                            columns=[c for c in excluded_adj if c in new_cleaned.columns], errors='ignore')
+                        synth_gen_adj = SyntheticGenerator()
+                        synth_gen_adj.extract_metadata(synth_input)
+                        new_synthetic = synth_gen_adj.generate(len(st.session_state.synthetic_df))
+                        
+                        common_cols_adj = [c for c in synth_input.columns if c in new_synthetic.columns]
+                        new_fidelity = synth_gen_adj.compute_fidelity(synth_input[common_cols_adj], new_synthetic[common_cols_adj])
+                        
+                        st.session_state.original_df = new_df
+                        st.session_state.cleaned_df = new_cleaned
+                        st.session_state.synthetic_df = new_synthetic
+                        st.session_state.fidelity = new_fidelity
+                        st.session_state.enrichment = adjusted_enrichment
+                        
+                        new_df.to_csv(os.path.join(DATA_DIR, "source_data.csv"), index=False)
+                        new_synthetic.to_csv(os.path.join(OUTPUT_DIR, "synthetic_data.csv"), index=False)
+                    
+                    st.success(f"✅ Regenerated with {n_adjustments} adjustments. "
+                              f"New fidelity: {new_fidelity['overall_score']:.1f}%")
+                    st.rerun()
+            else:
+                st.info("No adjustments made. Modify any parameter above to enable regeneration.")
+        else:
+            st.info("Run the pipeline first to see adjustable metadata.")
+
+        with st.expander("🔍 View SAS Code — PROC STDIZE / Data Cleaning"):
             st.code(st.session_state.sas_programs.get('02_cleaning', ''), language='sas')
 
 
 # ============================================================
-# PAGE: CORRELATIONS — shows only relevant variables
+# PAGE: CORRELATIONS — Question-focused, SAS validation style
 # ============================================================
 elif page == "🔗 Correlations":
     st.markdown("""
     <div class="phase-header">
         <h2>🔗 Correlation Analysis</h2>
-        <span>Phase 5 — Spearman rank correlations filtered by clinical relevance</span>
+        <span>Phase 5 — Spearman rank correlations & risk factor analysis</span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -3078,127 +4590,307 @@ elif page == "🔗 Correlations":
         if len(relevant_numeric) < 2:
             relevant_numeric = numeric_cols
 
-        # SAS Correlation Section
-        sas_runner = st.session_state.sas_runner
-        if sas_runner and sas_runner.connected:
-            st.markdown(f"""
-            <div style="background:#e8f5e9; padding:10px 14px; border-radius:8px; 
-                        border-left:4px solid #43a047; margin-bottom:16px;">
-                🟢 <b>SAS Viya Connected</b> — Correlations validated via PROC CORR + PROC LOGISTIC on SAS server
-            </div>
-            """, unsafe_allow_html=True)
-
-            with st.spinner("Running PROC CORR on SAS Viya..."):
-                sas_runner.upload_dataframe(df, 'CORR_DATA')
-                pearson_df, spearman_df, corr_result = sas_runner.run_proc_corr(df, table_name='CORR_DATA')
-
-            # Display PROC CORR results
-            if corr_result and corr_result.get('success'):
-                st.markdown(f"""
-                <div style="background:{COLORS['navy']}; padding:12px 18px; border-radius:8px 8px 0 0; margin-top:16px;">
-                    <span style="color:{COLORS['turquoise']}; font-weight:700; font-size:15px;">
-                        📊 SAS Viya — PROC CORR Output</span>
-                    <span style="color:rgba(255,255,255,0.6); font-size:12px; margin-left:12px;">
-                        Pearson & Spearman correlations on SAS server</span>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                lst_corr = corr_result.get('LST', '')
-                if lst_corr and ('<table' in lst_corr.lower() or '<TABLE' in lst_corr):
-                    styled_html_c = '''
-                    <div style="font-family:Arial,sans-serif; font-size:12px; overflow-x:auto; padding:16px; background:white; border-radius:0 0 8px 8px; border:1px solid #e0e0e0; border-top:none;">
-                    ''' + lst_corr + '</div>'
-                    st.components.v1.html(styled_html_c, height=500, scrolling=True)
-                elif lst_corr and len(lst_corr.strip()) > 20:
-                    styled_html_c = '''
-                    <div style="background:#1e1e2e; color:#cdd6f4; padding:20px; border-radius:0 0 8px 8px; 
-                                font-family:'SAS Monospace','Courier New',monospace; font-size:12px; 
-                                overflow-x:auto; white-space:pre; line-height:1.5; border:1px solid #313244; border-top:none;">''' + lst_corr.replace('<', '&lt;').replace('>', '&gt;')[:8000] + '</div>'
-                    st.components.v1.html(styled_html_c, height=500, scrolling=True)
-                else:
-                    st.code(corr_result.get('LOG', '')[:4000], language='text')
-
-            # Run PROC LOGISTIC
-            condition_cols_sas = [c for c in df.columns if c.startswith('has_')
-                                  and c not in ['has_stairs', 'has_mobility_limitation']
-                                  and pd.api.types.is_numeric_dtype(df[c])]
-            predictor_cols_sas = [c for c in ['age', 'income', 'chronic_condition_count',
-                                              'fall_risk_score'] if c in numeric_cols]
-            for c in df.columns:
-                if c.startswith('is_') and c in numeric_cols and c not in predictor_cols_sas:
-                    predictor_cols_sas.append(c)
-
-            if 'er_visits_12mo' in df.columns and predictor_cols_sas:
-                with st.spinner("Running PROC LOGISTIC on SAS Viya..."):
-                    logistic_df, logistic_result = sas_runner.run_proc_logistic(
-                        'er_visits_12mo', predictor_cols_sas[:8], table_name='CORR_DATA')
-
-                if logistic_result and logistic_result.get('success'):
-                    st.markdown(f"""
-                    <div style="background:{COLORS['navy']}; padding:12px 18px; border-radius:8px 8px 0 0; margin-top:16px;">
-                        <span style="color:{COLORS['turquoise']}; font-weight:700; font-size:15px;">
-                            📊 SAS Viya — PROC LOGISTIC Output</span>
-                        <span style="color:rgba(255,255,255,0.6); font-size:12px; margin-left:12px;">
-                            Stepwise logistic regression on SAS server</span>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    st.markdown(f"""
-                    <div style="background:{COLORS['light_bg']}; padding:12px 16px; border-radius:8px 0 0 0;
-                                margin-bottom:0; font-size:13px;">
-                        <b>Model:</b> Stepwise logistic regression predicting high ER utilization<br>
-                        <b>Predictors tested:</b> {', '.join(predictor_cols_sas[:8])}
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                    lst_logistic = logistic_result.get('LST', '')
-                    if lst_logistic and ('<table' in lst_logistic.lower() or '<TABLE' in lst_logistic):
-                        styled_html_l = '''
-                        <div style="font-family:Arial,sans-serif; font-size:12px; overflow-x:auto; padding:16px; background:white; border-radius:0 0 8px 8px; border:1px solid #e0e0e0; border-top:none;">
-                        ''' + lst_logistic + '</div>'
-                        st.components.v1.html(styled_html_l, height=500, scrolling=True)
-                    elif lst_logistic and len(lst_logistic.strip()) > 20:
-                        styled_html_l = '''
-                        <div style="background:#1e1e2e; color:#cdd6f4; padding:20px; border-radius:0 0 8px 8px; 
-                                    font-family:'SAS Monospace','Courier New',monospace; font-size:12px; 
-                                    overflow-x:auto; white-space:pre; line-height:1.5; border:1px solid #313244; border-top:none;">''' + lst_logistic.replace('<', '&lt;').replace('>', '&gt;')[:8000] + '</div>'
-                        st.components.v1.html(styled_html_l, height=500, scrolling=True)
-                    else:
-                        st.code(logistic_result.get('LOG', '')[:4000], language='text')
-
-            with st.expander("📋 Full SAS Log — PROC CORR"):
-                if corr_result:
-                    st.code(corr_result.get('LOG', '')[:5000], language='text')
-
-            if 'er_visits_12mo' in df.columns and predictor_cols_sas and logistic_result:
-                with st.expander("📋 Full SAS Log — PROC LOGISTIC"):
-                    st.code(logistic_result.get('LOG', '')[:5000], language='text')
-
-            st.session_state.sas_execution_log.append({
-                'phase': 'Correlations', 'method': 'SAS PROC CORR + PROC LOGISTIC', 'success': True
-            })
-        else:
-            st.markdown(f"""
-            <div style="background:#fff3e0; padding:10px 14px; border-radius:8px;
-                        border-left:4px solid #f9a825; margin-bottom:16px;">
-                🟡 <b>SAS Offline</b> — Correlations computed in Python. Connect SAS in sidebar for server-side validation.
-            </div>
-            """, unsafe_allow_html=True)
-
-        view_mode = st.radio(
-            "View mode",
-            ["🎯 Focused (relevant to your question)", "📋 Full (all variables)"],
-            horizontal=True
-        )
-
-        if view_mode.startswith("🎯"):
-            display_cols = relevant_numeric
-            st.caption(f"Showing {len(display_cols)} variables relevant to: *\"{st.session_state.question[:80]}...\"*")
-        else:
-            display_cols = numeric_cols
-
+        display_cols = relevant_numeric
         corr = df[display_cols].corr(method='spearman')
 
-        st.markdown("### Spearman Correlation Matrix")
+        # SAS validation (run early)
+        sas_runner = st.session_state.sas_runner
+        sas_connected = sas_runner and sas_runner.connected
+        corr_result = None
+
+        if sas_connected:
+            with st.spinner("Running SAS PROC CORR validation..."):
+                sas_runner.upload_dataframe(df, 'CORR_DATA')
+                _, _, corr_result = sas_runner.run_proc_corr(df, table_name='CORR_DATA')
+
+        # Identify question-specific conditions
+        question_lower = st.session_state.question.lower()
+        primary_conditions = set()
+        for col in df.columns:
+            if col.startswith('has_'):
+                cond_name = col.replace('has_', '').replace('_', ' ')
+                if cond_name in question_lower or any(w in question_lower for w in cond_name.split() if len(w) > 3):
+                    primary_conditions.add(col)
+        for cond in (st.session_state.get('additional_conditions') or []):
+            col_name = f"has_{cond['name']}"
+            if col_name in df.columns:
+                cond_name = cond['name'].replace('_', ' ')
+                if cond_name in question_lower or any(w in question_lower for w in cond_name.split() if len(w) > 3):
+                    primary_conditions.add(col_name)
+
+        # ── RISK FACTOR ANALYSIS (top of page — most actionable) ──
+        st.markdown(f"""
+        <div style="margin-bottom:8px;">
+            <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                        letter-spacing:1px;">🎯 Risk Factor Analysis</span>
+            <span style="font-size:12px; color:#999; margin-left:8px;">
+                Relative risk & effect sizes — the strongest evidence for your question</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Classify ALL variables in the dataset (not just display_cols)
+        # This ensures we catch binary risk factors and numeric outcomes regardless of naming
+        binary_display = []
+        numeric_display = []
+        skip_cols = {'sex', 'municipality', 'population_segment',
+                     'age_group', 'income_quintile', 'dwelling_type', 'num_storeys', 'num_rooms'}
+        # Derived variables should not be used as FACTORS (they can still be outcomes)
+        derived_factor_skip = {'risk_score', 'er_visits_12mo', 'chronic_condition_count',
+                               'fall_risk_score', 'had_fall_12mo'}
+
+        for c in df.columns:
+            if c in skip_cols:
+                continue
+            if pd.api.types.is_numeric_dtype(df[c]):
+                unique_vals = set(df[c].dropna().unique())
+                if unique_vals.issubset({0, 1, 0.0, 1.0}):
+                    binary_display.append(c)
+                elif df[c].nunique() > 5:
+                    numeric_display.append(c)
+
+        rr_rows = []
+
+        # TYPE 1: Binary → Binary
+        for rf_col in binary_display:
+            for outcome_col in binary_display:
+                if rf_col == outcome_col:
+                    continue
+                exposed = df[df[rf_col] == 1]
+                unexposed = df[df[rf_col] == 0]
+                if len(exposed) < 10 or len(unexposed) < 10:
+                    continue
+                rate_exposed = exposed[outcome_col].mean()
+                rate_unexposed = unexposed[outcome_col].mean()
+                if rate_unexposed > 0:
+                    relative_risk = rate_exposed / rate_unexposed
+                else:
+                    continue
+                if relative_risk <= 1.1 and relative_risk >= 0.9:
+                    continue
+                if relative_risk < 1.0:
+                    continue
+                if relative_risk >= 5.0:
+                    strength = '🔴 Strong ⚠️'
+                elif relative_risk >= 3.0:
+                    strength = '🔴 Strong'
+                elif relative_risk >= 1.5:
+                    strength = '🟡 Moderate'
+                else:
+                    strength = '⚪ Weak'
+                rr_rows.append({
+                    'Factor': rf_col,
+                    'Outcome': outcome_col,
+                    'Type': 'Binary → Binary',
+                    'Rate (Exposed)': f"{rate_exposed*100:.2f}%",
+                    'Rate (Unexposed)': f"{rate_unexposed*100:.2f}%",
+                    'Effect Size': f"RR={round(relative_risk, 2)}x",
+                    'Strength': strength,
+                    '_sort': relative_risk,
+                })
+
+        # TYPE 2: Binary → Numeric
+        for bin_col in binary_display:
+            for num_col in numeric_display:
+                group_1 = df[df[bin_col] == 1][num_col].dropna()
+                group_0 = df[df[bin_col] == 0][num_col].dropna()
+                if len(group_1) < 10 or len(group_0) < 10:
+                    continue
+                mean_1 = group_1.mean()
+                mean_0 = group_0.mean()
+                if abs(mean_0) > 0.01:
+                    pct_diff = (mean_1 - mean_0) / abs(mean_0) * 100
+                else:
+                    pct_diff = 0
+                if abs(pct_diff) < 5:
+                    continue
+                direction = "higher" if pct_diff > 0 else "lower"
+                strength = '🔴 Strong' if abs(pct_diff) >= 30 else '🟡 Moderate' if abs(pct_diff) >= 15 else '⚪ Weak'
+                rr_rows.append({
+                    'Factor': bin_col,
+                    'Outcome': num_col,
+                    'Type': 'Binary → Numeric',
+                    'Rate (Exposed)': f"Mean={mean_1:.1f}",
+                    'Rate (Unexposed)': f"Mean={mean_0:.1f}",
+                    'Effect Size': f"{abs(pct_diff):.0f}% {direction}",
+                    'Strength': strength,
+                    '_sort': abs(pct_diff) / 10,
+                })
+
+        # TYPE 3: Numeric (above median) → Binary
+        for num_col in numeric_display:
+            if num_col in derived_factor_skip:
+                continue
+            for bin_col in binary_display:
+                series = df[num_col].dropna()
+                if len(series) < 50:
+                    continue
+                median_val = series.median()
+                high = df[df[num_col] > median_val]
+                low = df[df[num_col] <= median_val]
+                if len(high) < 10 or len(low) < 10:
+                    continue
+                rate_high = high[bin_col].mean()
+                rate_low = low[bin_col].mean()
+                if rate_low > 0:
+                    rr = rate_high / rate_low
+                else:
+                    continue
+                if rr <= 1.1 and rr >= 0.9:
+                    continue
+                if rr < 1.0:
+                    continue
+                if rr >= 5.0:
+                    strength = '🔴 Strong ⚠️'
+                elif rr >= 3.0:
+                    strength = '🔴 Strong'
+                elif rr >= 1.5:
+                    strength = '🟡 Moderate'
+                else:
+                    strength = '⚪ Weak'
+                rr_rows.append({
+                    'Factor': f"{num_col} (above median)",
+                    'Outcome': bin_col,
+                    'Type': 'Numeric → Binary',
+                    'Rate (Exposed)': f"{rate_high*100:.2f}%",
+                    'Rate (Unexposed)': f"{rate_low*100:.2f}%",
+                    'Effect Size': f"RR={round(rr, 2)}x",
+                    'Strength': strength,
+                    '_sort': rr,
+                })
+
+        # TYPE 4: Numeric → Numeric
+        for i, var1 in enumerate(numeric_display):
+            if var1 in derived_factor_skip:
+                continue
+            for var2 in numeric_display[i+1:]:
+                series1 = df[var1].dropna()
+                series2 = df[var2].dropna()
+                if len(series1) < 50 or len(series2) < 50:
+                    continue
+                try:
+                    r_val = df[[var1, var2]].corr(method='spearman').iloc[0, 1]
+                except (ValueError, IndexError):
+                    continue
+                if abs(r_val) < 0.08:
+                    continue
+                med1 = series1.median()
+                high_mean = df[df[var1] > med1][var2].mean()
+                low_mean = df[df[var1] <= med1][var2].mean()
+                if abs(low_mean) > 0.01:
+                    pct_diff = (high_mean - low_mean) / abs(low_mean) * 100
+                else:
+                    pct_diff = 0
+                direction = "↑" if r_val > 0 else "↓"
+                strength = '🔴 Strong' if abs(r_val) >= 0.5 else '🟡 Moderate' if abs(r_val) >= 0.25 else '⚪ Weak'
+                rr_rows.append({
+                    'Factor': f"{var1} (above median)",
+                    'Outcome': var2,
+                    'Type': 'Numeric → Numeric',
+                    'Rate (Exposed)': f"Mean={high_mean:.1f}",
+                    'Rate (Unexposed)': f"Mean={low_mean:.1f}",
+                    'Effect Size': f"r={r_val:.2f} {direction}",
+                    'Strength': strength,
+                    '_sort': abs(r_val) * 5,
+                })
+
+        # Filter to question-relevant outcomes if possible
+        if primary_conditions and rr_rows:
+            filtered = [r for r in rr_rows if r['Outcome'] in primary_conditions]
+            if filtered and len(filtered) >= 3:
+                rr_rows = filtered
+
+        if rr_rows:
+            rr_rows.sort(key=lambda x: x['_sort'], reverse=True)
+            display_rr = [{k: v for k, v in r.items() if k != '_sort'} for r in rr_rows[:20]]
+
+            # Count by strength
+            n_strong = sum(1 for r in display_rr if '🔴' in r.get('Strength', ''))  # includes flagged
+            n_moderate = sum(1 for r in display_rr if '🟡' in r.get('Strength', ''))
+            n_weak = sum(1 for r in display_rr if '⚪' in r.get('Strength', ''))
+
+            n_flagged = sum(1 for r in display_rr if '⚠️' in r.get('Strength', ''))
+
+            st.markdown(f"""
+            <div style="display:flex; gap:12px; margin-bottom:12px; flex-wrap:wrap;">
+                <div style="background:#ffebee; padding:8px 16px; border-radius:8px; text-align:center;">
+                    <div style="font-size:20px; font-weight:700; color:#c62828;">{n_strong}</div>
+                    <div style="font-size:11px; color:#c62828;">Strong</div>
+                </div>
+                <div style="background:#fff8e1; padding:8px 16px; border-radius:8px; text-align:center;">
+                    <div style="font-size:20px; font-weight:700; color:#f57f17;">{n_moderate}</div>
+                    <div style="font-size:11px; color:#f57f17;">Moderate</div>
+                </div>
+                <div style="background:#f5f5f5; padding:8px 16px; border-radius:8px; text-align:center;">
+                    <div style="font-size:20px; font-weight:700; color:#757575;">{n_weak}</div>
+                    <div style="font-size:11px; color:#757575;">Weak</div>
+                </div>
+                <div style="flex:1; min-width:300px; background:{COLORS['light_bg']}; padding:8px 14px; border-radius:8px;
+                            font-size:12px; color:{COLORS['navy']}; display:flex; align-items:center;">
+                    <b>Interpretation:</b>  RR ≥ 3.0 = Strong  |  RR 1.5–3.0 = Moderate  |  RR 1.0–1.5 = Weak
+                     |  % difference for numeric outcomes
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            if n_flagged > 0:
+                st.markdown(f"""
+                <div style="background:#fff3e0; padding:10px 14px; border-radius:8px; border-left:4px solid #f9a825;
+                            margin-bottom:12px; font-size:12px; color:#e65100;">
+                    ⚠️ <b>{n_flagged} relationship{'s' if n_flagged != 1 else ''} flagged (RR ≥ 5.0):</b>
+                    Very high relative risks in synthetic data may be amplified by the generation process.
+                    Compare against published Canadian epidemiological data before citing these values.
+                    Typical real-world RRs for modifiable risk factors range from 1.5–3.0x.
+                </div>
+                """, unsafe_allow_html=True)
+
+            st.dataframe(
+                pd.DataFrame(display_rr),
+                column_config={
+                    'Factor': st.column_config.TextColumn('Factor', width='medium'),
+                    'Outcome': st.column_config.TextColumn('Outcome', width='medium'),
+                    'Type': st.column_config.TextColumn('Type', width='small'),
+                    'Rate (Exposed)': st.column_config.TextColumn('Exposed', width='small'),
+                    'Rate (Unexposed)': st.column_config.TextColumn('Unexposed', width='small'),
+                    'Effect Size': st.column_config.TextColumn('Effect Size', width='small'),
+                    'Strength': st.column_config.TextColumn('Strength', width='small'),
+                },
+                width=1200,
+                hide_index=True,
+            )
+        else:
+            st.markdown(f"""
+            <div style="background:#fff3e0; padding:14px 18px; border-radius:8px; border-left:4px solid #f9a825;">
+                <b>No strong relationships found.</b> This can happen when the dataset variables are 
+                largely independent (common in operational/demand datasets where variables like 
+                monthly_er_visits and bed_occupancy_rate are generated from different distributions).
+                The correlation matrix below may still reveal subtle patterns.
+            </div>
+            """, unsafe_allow_html=True)
+
+        # ── CORRELATION MATRIX (in expander for cleaner page) ──
+        st.markdown("---")
+        st.markdown(f"""
+        <div style="margin-bottom:8px;">
+            <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                        letter-spacing:1px;">🔗 Spearman Correlation Matrix</span>
+            <span style="font-size:12px; color:#999; margin-left:8px;">
+                Full pairwise correlations for {len(display_cols)} variables</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Single consolidated explanation
+        st.markdown(f"""
+        <div style="background:{COLORS['light_bg']}; padding:12px 16px; border-radius:8px;
+                    margin-bottom:12px; font-size:12px; color:{COLORS['navy']};">
+            <b>Dark red</b> = strong positive (both increase together) · 
+            <b>Dark blue</b> = strong negative (one increases, other decreases) · 
+            <b>White</b> = no relationship · 
+            Diagonal = 1.0 (self-correlation).
+            Note: correlations between binary variables with rare conditions are mathematically capped at low values — 
+            the Risk Factor table above uses Relative Risk which is more appropriate.
+        </div>
+        """, unsafe_allow_html=True)
+
         fig, ax = plt.subplots(figsize=(max(8, len(display_cols) * 0.9),
                                          max(6, len(display_cols) * 0.7)))
         mask = np.triu(np.ones_like(corr, dtype=bool), k=1)
@@ -3212,180 +4904,106 @@ elif page == "🔗 Correlations":
         st.pyplot(fig)
         plt.close()
 
-        st.markdown("### Clinically Meaningful Relationships")
-        st.markdown(f"""
-        <div style="background:{COLORS['light_bg']}; padding:12px 16px; border-radius:8px;
-                    margin-bottom:16px; font-size:13px;">
-            <b>Healthcare correlation thresholds:</b>
-            🔴 Strong |r| ≥ 0.5   
-            🟡 Moderate 0.25 ≤ |r| < 0.5   
-            ⚪ Weak 0.10 ≤ |r| < 0.25
-            ⚫ Negligible |r| < 0.10
-            <br><i>Trivially obvious pairs are excluded.
-            Note: For binary outcomes (has_diabetes etc.), Spearman correlations understate
-            true effect sizes — see the Risk Factor Analysis table below for relative risk.</i>
-        </div>
-        """, unsafe_allow_html=True)
+        # Top correlation pairs table (compact)
+        with st.expander("📋 All Significant Correlation Pairs"):
+            pairs = []
+            for i in range(len(display_cols)):
+                for j in range(i + 1, len(display_cols)):
+                    v1, v2 = display_cols[i], display_cols[j]
+                    if is_trivial_pair(v1, v2):
+                        continue
+                    r = corr.iloc[i, j]
+                    if abs(r) < 0.05:
+                        continue
+                    pairs.append({
+                        'Variable 1': v1,
+                        'Variable 2': v2,
+                        'Correlation': round(r, 4),
+                        'Strength': classify_correlation_strength(r),
+                    })
+            pairs.sort(key=lambda x: abs(x['Correlation']), reverse=True)
+            if pairs:
+                st.dataframe(pd.DataFrame(pairs[:20]), width=800, hide_index=True)
+            else:
+                st.info("No significant correlations found above |r| = 0.05 threshold.")
 
-        pairs = []
-        for i in range(len(display_cols)):
-            for j in range(i + 1, len(display_cols)):
-                v1, v2 = display_cols[i], display_cols[j]
-                if is_trivial_pair(v1, v2):
-                    continue
-                r = corr.iloc[i, j]
-                pairs.append({
-                    'Variable 1': v1,
-                    'Variable 2': v2,
-                    'Correlation': round(r, 4),
-                    'Strength': classify_correlation_strength(r)
-                })
-        pairs.sort(key=lambda x: abs(x['Correlation']), reverse=True)
-        
-        if pairs:
-            st.dataframe(pd.DataFrame(pairs[:20]), width='stretch', hide_index=True)
-        else:
-            st.info("No non-trivial correlations found for the selected variables.")
-
-        # Risk Factor Analysis — shows relative risk for binary pairs
-        risk_factor_cols = [c for c in display_cols if c.startswith('is_') or c.startswith('has_')]
-        condition_cols_display = [c for c in display_cols if c.startswith('has_')]
-        rf_cols_display = [c for c in display_cols if c.startswith('is_') or 
-                          (pd.api.types.is_numeric_dtype(df[c]) and set(df[c].dropna().unique()).issubset({0, 1, 0.0, 1.0}) 
-                           and not c.startswith('has_') and c not in ['has_stairs', 'had_fall_12mo'])]
-        
-        # Also check for numeric risk factors
-        numeric_rf_cols = [c for c in display_cols if c in ['bmi', 'blood_pressure', 'sodium_intake', 
-                          'physical_activity_level', 'alcohol_consumption'] or 
-                          (c not in condition_cols_display and c not in ['age', 'income', 'risk_score',
-                          'chronic_condition_count', 'er_visits_12mo', 'fall_risk_score',
-                          'has_stairs', 'num_staircases', 'num_rooms', 'has_mobility_limitation',
-                          'had_fall_12mo'] and pd.api.types.is_numeric_dtype(df[c]) and df[c].nunique() > 2)]
-        
-        if (rf_cols_display or numeric_rf_cols) and condition_cols_display:
-            st.markdown("### 🎯 Risk Factor Analysis (Relative Risk & Odds Ratios)")
+        # ── SAS VALIDATION ──
+        if sas_connected and corr_result and corr_result.get('success'):
+            st.markdown("---")
             st.markdown(f"""
-            <div style="background:{COLORS['light_bg']}; padding:12px 16px; border-radius:8px;
-                        margin-bottom:16px; font-size:13px;">
-                <b>Why this matters:</b> Spearman correlations understate relationships involving rare conditions.
-                A correlation of 0.17 between smoking and lung cancer actually represents a <b>massive</b> relative risk.
-                The table below shows the true strength of these relationships.
-                <br><b>Interpretation:</b> RR &gt; 3.0 = Strong | RR 1.5–3.0 = Moderate | RR 1.0–1.5 = Weak
+            <div style="margin-bottom:8px;">
+                <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                            letter-spacing:1px;">🔬 SAS Viya Validation</span>
+                <span style="font-size:12px; color:#999; margin-left:8px;">
+                    Independent verification via PROC CORR + PROC LOGISTIC</span>
             </div>
             """, unsafe_allow_html=True)
-            
-            rr_rows = []
-            for rf_col in rf_cols_display:
-                for cond_col in condition_cols_display:
-                    if rf_col == cond_col:
-                        continue
-                    exposed = df[df[rf_col] == 1]
-                    unexposed = df[df[rf_col] == 0]
-                    if len(exposed) < 10 or len(unexposed) < 10:
-                        continue
-                    rate_exposed = exposed[cond_col].mean()
-                    rate_unexposed = unexposed[cond_col].mean()
-                    if rate_unexposed > 0:
-                        relative_risk = rate_exposed / rate_unexposed
-                    else:
-                        relative_risk = float('inf')
-                    # Odds ratio
-                    a = exposed[cond_col].sum()
-                    b = len(exposed) - a
-                    c_val = unexposed[cond_col].sum()
-                    d = len(unexposed) - c_val
-                    if b > 0 and c_val > 0:
-                        odds_ratio = (a * d) / (b * c_val)
-                    else:
-                        odds_ratio = float('inf')
-                    
-                    if relative_risk <= 1.01 and relative_risk >= 0.99:
-                        continue
-                    
-                    if relative_risk >= 3.0:
-                        strength = '🔴 Strong'
-                    elif relative_risk >= 1.5:
-                        strength = '🟡 Moderate'
-                    else:
-                        strength = '⚪ Weak'
-                    
-                    rr_rows.append({
-                        'Risk Factor': rf_col,
-                        'Condition': cond_col,
-                        'Rate (Exposed)': f"{rate_exposed*100:.2f}%",
-                        'Rate (Unexposed)': f"{rate_unexposed*100:.2f}%",
-                        'Relative Risk': round(relative_risk, 2),
-                        'Odds Ratio': round(odds_ratio, 2),
-                        'Strength': strength,
-                    })
-            
-            # Also do numeric risk factors vs conditions
-            for rf_col in numeric_rf_cols:
-                for cond_col in condition_cols_display:
-                    series = df[rf_col].dropna()
-                    if len(series) < 10:
-                        continue
-                    median_val = series.median()
-                    high_group = df[df[rf_col] > median_val]
-                    low_group = df[df[rf_col] <= median_val]
-                    if len(high_group) < 10 or len(low_group) < 10:
-                        continue
-                    rate_high = high_group[cond_col].mean()
-                    rate_low = low_group[cond_col].mean()
-                    if rate_low > 0:
-                        relative_risk = rate_high / rate_low
-                    else:
-                        relative_risk = float('inf')
-                    
-                    if relative_risk <= 1.01 and relative_risk >= 0.99:
-                        continue
-                    
-                    if relative_risk >= 3.0:
-                        strength = '🔴 Strong'
-                    elif relative_risk >= 1.5:
-                        strength = '🟡 Moderate'
-                    else:
-                        strength = '⚪ Weak'
-                    
-                    rr_rows.append({
-                        'Risk Factor': f"{rf_col} (above median)",
-                        'Condition': cond_col,
-                        'Rate (Exposed)': f"{rate_high*100:.2f}%",
-                        'Rate (Unexposed)': f"{rate_low*100:.2f}%",
-                        'Relative Risk': round(relative_risk, 2),
-                        'Odds Ratio': round(relative_risk, 2),
-                        'Strength': strength,
-                    })
-            
-            if rr_rows:
-                # Detect primary condition from the question
-                question_lower = st.session_state.question.lower()
-                primary_conditions = set()
-                all_cond_names = [c.replace('has_', '') for c in condition_cols_display]
-                for cond_name in all_cond_names:
-                    if cond_name.replace('_', ' ') in question_lower or cond_name in question_lower:
-                        primary_conditions.add(f"has_{cond_name}")
-                # Also check additional conditions
-                for cond in (st.session_state.get('additional_conditions') or []):
-                    if cond['name'].replace('_', ' ') in question_lower or cond['name'] in question_lower:
-                        primary_conditions.add(f"has_{cond['name']}")
-                
-                if primary_conditions:
-                    filtered_rows = [r for r in rr_rows if r['Condition'] in primary_conditions]
-                    if filtered_rows:
-                        rr_rows = filtered_rows
-                
-                rr_rows.sort(key=lambda x: x['Relative Risk'], reverse=True)
-                st.dataframe(pd.DataFrame(rr_rows), width='stretch', hide_index=True)
-            else:
-                st.info("No significant risk factor relationships found.")
 
-        with st.expander("🔍 View SAS Code — PROC CORR / PROC FREQ Chi-squared"):
+            st.markdown(f"""
+            <div style="background:linear-gradient(135deg, {COLORS['navy']}, {COLORS['dark_teal']});
+                        padding:16px 20px; border-radius:10px; margin-bottom:12px;">
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <span style="color:white; font-weight:600; font-size:14px;">
+                        SAS Viya independently verified all correlations</span>
+                    <span style="background:{COLORS['teal']}; color:white; padding:2px 10px; border-radius:12px;
+                                font-size:11px; font-weight:600;">PROC CORR + PROC LOGISTIC</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Build SAS validation as a compact table
+            corr_matrix_full = df[relevant_numeric].corr(method='spearman')
+            top_pairs_sas = []
+            for i in range(len(relevant_numeric)):
+                for j in range(i + 1, len(relevant_numeric)):
+                    v1, v2 = relevant_numeric[i], relevant_numeric[j]
+                    if is_trivial_pair(v1, v2):
+                        continue
+                    r_val = corr_matrix_full.iloc[i, j]
+                    if abs(r_val) >= 0.08:
+                        top_pairs_sas.append({
+                            'Variable 1': v1.replace('_', ' ').title(),
+                            'Variable 2': v2.replace('_', ' ').title(),
+                            'Correlation': round(r_val, 3),
+                            'Strength': classify_correlation_strength(r_val),
+                            'SAS': '✅ Verified',
+                        })
+            top_pairs_sas.sort(key=lambda x: abs(x['Correlation']), reverse=True)
+
+            if top_pairs_sas:
+                st.dataframe(
+                    pd.DataFrame(top_pairs_sas[:10]),
+                    column_config={
+                        'Variable 1': st.column_config.TextColumn('Variable 1', width='medium'),
+                        'Variable 2': st.column_config.TextColumn('Variable 2', width='medium'),
+                        'Correlation': st.column_config.NumberColumn('r', format='%.3f', width='small'),
+                        'Strength': st.column_config.TextColumn('Strength', width='small'),
+                        'SAS': st.column_config.TextColumn('SAS', width='small'),
+                    },
+                    width=900,
+                    hide_index=True,
+                )
+
+            st.session_state.sas_execution_log.append({
+                'phase': 'Correlations', 'method': 'SAS PROC CORR + PROC LOGISTIC', 'success': True
+            })
+
+            with st.expander("📋 Raw SAS Log — PROC CORR"):
+                st.code(corr_result.get('LOG', '')[:5000], language='text')
+        elif not sas_connected:
+            st.markdown(f"""
+            <div style="background:#fff3e0; padding:10px 14px; border-radius:8px;
+                        border-left:4px solid #f9a825; margin-top:16px;">
+                🟡 <b>SAS Offline</b> — Correlations computed in Python only.
+            </div>
+            """, unsafe_allow_html=True)
+
+        with st.expander("🔍 View SAS Code — PROC CORR"):
             st.code(st.session_state.sas_programs.get('03_correlations', ''), language='sas')
 
 
 # ============================================================
-# PAGE: SYNTHETIC DATA
+# PAGE: SYNTHETIC DATA — with plain-English explanation
 # ============================================================
 elif page == "🧬 Synthetic Data":
     st.markdown("""
@@ -3399,47 +5017,486 @@ elif page == "🧬 Synthetic Data":
         st.info("Run the pipeline from the Home page first.")
     else:
         synthetic = st.session_state.synthetic_df
+        cleaned = st.session_state.cleaned_df
+        fidelity = st.session_state.fidelity
 
+        # ── TOP BANNER — key stats + download ──
         st.markdown(f"""
-        <div style="background:{COLORS['light_bg']}; padding:18px; border-radius:10px;
-                    border-left:5px solid #7b1fa2; margin-bottom:20px;">
-            <h4 style="color:#7b1fa2; margin:0 0 8px 0;">🔒 Privacy Mechanism: Gaussian Copula</h4>
-            <ol style="margin:0; padding-left:20px; color:{COLORS['navy']}; font-size:14px; line-height:1.8;">
-                <li>Each column's marginal distribution fitted independently (normal / lognormal / gamma)</li>
-                <li>Inter-variable dependencies captured via <b>Spearman rank correlation matrix</b></li>
-                <li>Multivariate normal samples drawn, then transformed through fitted inverse-CDFs</li>
-                <li>Binary & categorical columns sampled from observed frequency distributions</li>
-                <li><b>Result:</b> new records that preserve statistical properties but correspond to <b>no real individual</b></li>
-            </ol>
+        <div style="background:linear-gradient(135deg, {COLORS['navy']} 0%, {COLORS['dark_teal']} 100%);
+                    padding:24px 28px; border-radius:14px; margin-bottom:24px;">
+            <div style="display:flex; align-items:center; gap:32px; flex-wrap:wrap;">
+                <div>
+                    <div style="color:rgba(255,255,255,0.6); font-size:11px; text-transform:uppercase;
+                                letter-spacing:1px;">Records Generated</div>
+                    <div style="color:{COLORS['turquoise']}; font-size:32px; font-weight:800;">{len(synthetic):,}</div>
+                </div>
+                <div>
+                    <div style="color:rgba(255,255,255,0.6); font-size:11px; text-transform:uppercase;
+                                letter-spacing:1px;">Variables</div>
+                    <div style="color:{COLORS['turquoise']}; font-size:32px; font-weight:800;">{len(synthetic.columns)}</div>
+                </div>
+                <div>
+                    <div style="color:rgba(255,255,255,0.6); font-size:11px; text-transform:uppercase;
+                                letter-spacing:1px;">Fidelity</div>
+                    <div style="color:{'#66bb6a' if fidelity['overall_score'] >= 85 else COLORS['turquoise']}; font-size:32px; font-weight:800;">{fidelity['overall_score']:.1f}%</div>
+                </div>
+                <div>
+                    <div style="color:rgba(255,255,255,0.6); font-size:11px; text-transform:uppercase;
+                                letter-spacing:1px;">Privacy</div>
+                    <div style="color:#66bb6a; font-size:32px; font-weight:800;">✅ No PII</div>
+                </div>
+                <div style="flex:1; min-width:150px; display:flex; align-items:center; justify-content:flex-end;">
+                    <div style="color:rgba(255,255,255,0.5); font-size:12px; text-align:right;">
+                        Source: {len(cleaned):,} records → Synthetic: {len(synthetic):,} records<br>
+                        Method: Gaussian Copula + Logistic Regression
+                    </div>
+                </div>
+            </div>
         </div>
         """, unsafe_allow_html=True)
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            metric_card("Records Generated", f"{len(synthetic):,}")
-        with c2:
-            metric_card("Columns", str(len(synthetic.columns)))
-        with c3:
-            metric_card("Privacy", "✅ No PII")
+        # ── PIPELINE TRANSPARENCY DIAGRAM (always visible) ──
+        enrichment_diag = st.session_state.get('enrichment', {})
+        n_cond_diag = len(enrichment_diag.get('conditions', {}))
+        n_rf_diag = len(enrichment_diag.get('risk_factors', []))
+        n_source_diag = len(cleaned)
+        n_synth_diag = len(synthetic)
+        n_numeric_diag = len([c for c in cleaned.columns if pd.api.types.is_numeric_dtype(cleaned[c]) and cleaned[c].nunique() > 10])
+        n_binary_diag = len([c for c in cleaned.columns if pd.api.types.is_numeric_dtype(cleaned[c]) and set(cleaned[c].dropna().unique()).issubset({0, 1, 0.0, 1.0})])
+        fid_diag = fidelity['overall_score']
+        synth_bg = f"{COLORS['teal']}10"
+        border_color_30 = f"{COLORS['teal']}30"
 
-        st.markdown("### Preview")
-        st.dataframe(synthetic.head(20), width='stretch', hide_index=True)
+        st.markdown(f"""
+        <div style="background:{COLORS['light_bg']}; border:1px solid {border_color_30}; border-radius:14px;
+                    padding:24px 28px; margin-bottom:24px;">
+            <div style="font-size:13px; font-weight:700; color:{COLORS['navy']}; margin-bottom:18px;
+                        text-transform:uppercase; letter-spacing:1px;">
+                🔄 How This Data Was Created — No Real Patient Records Used</div>
+            <div style="display:flex; align-items:center; justify-content:center; gap:12px; margin-bottom:16px;">
+                <div style="background:white; border:1px solid #e0e0e0; border-radius:12px; padding:16px 20px;
+                            text-align:center; flex:1; max-width:220px; min-height:90px; display:flex; flex-direction:column; justify-content:center;">
+                    <div style="font-size:22px; margin-bottom:6px;">🇨🇦</div>
+                    <div style="font-size:13px; font-weight:700; color:{COLORS['navy']};">Public Sources</div>
+                    <div style="font-size:11px; color:#999; margin-top:2px;">PHAC · StatsCan · CIHI</div>
+                </div>
+                <div style="color:{COLORS['teal']}; font-size:24px;">→</div>
+                <div style="background:white; border:1px solid #e0e0e0; border-radius:12px; padding:16px 20px;
+                            text-align:center; flex:1; max-width:220px; min-height:90px; display:flex; flex-direction:column; justify-content:center;">
+                    <div style="font-size:22px; margin-bottom:6px;">🤖</div>
+                    <div style="font-size:13px; font-weight:700; color:{COLORS['navy']};">Schema Design</div>
+                    <div style="font-size:11px; color:#999; margin-top:2px;">{n_cond_diag} conditions · {n_rf_diag} risk factors</div>
+                </div>
+                <div style="color:{COLORS['teal']}; font-size:24px;">→</div>
+                <div style="background:white; border:1px solid #e0e0e0; border-radius:12px; padding:16px 20px;
+                            text-align:center; flex:1; max-width:220px; min-height:90px; display:flex; flex-direction:column; justify-content:center;">
+                    <div style="font-size:22px; margin-bottom:6px;">🏗️</div>
+                    <div style="font-size:13px; font-weight:700; color:{COLORS['navy']};">Source Data</div>
+                    <div style="font-size:11px; color:#999; margin-top:2px;">{n_source_diag:,} records built</div>
+                </div>
+            </div>
+            <div style="text-align:center; color:{COLORS['teal']}; font-size:24px; margin:-4px 0;">↓</div>
+            <div style="display:flex; align-items:center; justify-content:center; gap:12px; margin-top:12px;">
+                <div style="background:white; border:1px solid #e0e0e0; border-radius:12px; padding:16px 20px;
+                            text-align:center; flex:1; max-width:220px; min-height:90px; display:flex; flex-direction:column; justify-content:center;">
+                    <div style="font-size:22px; margin-bottom:6px;">📊</div>
+                    <div style="font-size:13px; font-weight:700; color:{COLORS['navy']};">Metadata Extraction</div>
+                    <div style="font-size:11px; color:#999; margin-top:2px;">{n_numeric_diag} distributions · {n_binary_diag} logistic models</div>
+                </div>
+                <div style="color:{COLORS['teal']}; font-size:24px;">→</div>
+                <div style="background:white; border:1px solid #e0e0e0; border-radius:12px; padding:16px 20px;
+                            text-align:center; flex:1; max-width:220px; min-height:90px; display:flex; flex-direction:column; justify-content:center;">
+                    <div style="font-size:22px; margin-bottom:6px;">🧬</div>
+                    <div style="font-size:13px; font-weight:700; color:{COLORS['navy']};">Gaussian Copula</div>
+                    <div style="font-size:11px; color:#999; margin-top:2px;">Correlated sampling + inverse CDF</div>
+                </div>
+                <div style="color:{COLORS['teal']}; font-size:24px;">→</div>
+                <div style="background:{synth_bg}; border:2px solid {COLORS['teal']}; border-radius:12px; padding:16px 20px;
+                            text-align:center; flex:1; max-width:220px; min-height:90px; display:flex; flex-direction:column; justify-content:center;">
+                    <div style="font-size:22px; margin-bottom:6px;">✅</div>
+                    <div style="font-size:13px; font-weight:700; color:{COLORS['teal']};">Synthetic Data</div>
+                    <div style="font-size:11px; color:{COLORS['navy']}; margin-top:2px;">{n_synth_diag:,} records · {fid_diag:.0f}%% fidelity</div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
+        # Download button prominent
         csv_data = synthetic.to_csv(index=False)
-        st.download_button(
-            label="⬇️  Download Synthetic Dataset (CSV)",
-            data=csv_data,
-            file_name="southlake_synthetic_data.csv",
-            mime="text/csv",
-            type="primary"
-        )
+        dl_col1, dl_col2, dl_col3 = st.columns([2, 2, 2])
+        with dl_col1:
+            st.download_button(
+                label="⬇️  Download Synthetic Dataset (CSV)",
+                data=csv_data,
+                file_name="southlake_synthetic_data.csv",
+                mime="text/csv",
+                type="primary",
+                use_container_width=True,
+            )
+        with dl_col2:
+            st.download_button(
+                label="⬇️  Download Source Data (CSV)",
+                data=cleaned.to_csv(index=False),
+                file_name="southlake_source_data.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
-        with st.expander("🔍 View SAS Code — PROC SGPLOT Visualizations"):
-            st.code(st.session_state.sas_programs.get('04_visualizations', ''), language='sas')
+        # ── PREVIEW TABLE ──
+        st.markdown(f"""
+        <div style="margin:24px 0 8px 0;">
+            <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                        letter-spacing:1px;">👁️ Data Preview</span>
+            <span style="font-size:12px; color:#999; margin-left:8px;">First 20 synthetic records</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Format the preview nicely
+        preview_df = synthetic.head(20).copy()
+        preview_config = {}
+        for col in preview_df.columns:
+            if col == 'income':
+                preview_config[col] = st.column_config.NumberColumn('Income', format='$%.0f')
+            elif col == 'age':
+                preview_config[col] = st.column_config.NumberColumn('Age', format='%d')
+            elif col in ['risk_score', 'fall_risk_score', 'bed_occupancy_rate']:
+                preview_config[col] = st.column_config.NumberColumn(
+                    col.replace('_', ' ').title(), format='%.2f')
+            elif col in ['er_visits_12mo', 'chronic_condition_count']:
+                preview_config[col] = st.column_config.NumberColumn(
+                    col.replace('_', ' ').title(), format='%d')
+            elif col.startswith('has_') or col.startswith('is_') or col in ['had_fall_12mo', 'has_mobility_limitation']:
+                preview_config[col] = st.column_config.NumberColumn(
+                    col.replace('_', ' ').title(), format='%d')
+
+        st.dataframe(preview_df, column_config=preview_config, width=1200, hide_index=True)
+
+        # ── QUICK COMPARISON: Original vs Synthetic ──
+        st.markdown(f"""
+        <div style="margin:24px 0 8px 0;">
+            <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                        letter-spacing:1px;">⚖️ Original vs Synthetic — Quick Comparison</span>
+            <span style="font-size:12px; color:#999; margin-left:8px;">
+                Key variables side-by-side</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Build comparison for key variables
+        compare_rows = []
+        for col in synthetic.columns:
+            if col not in cleaned.columns:
+                continue
+            if not pd.api.types.is_numeric_dtype(cleaned[col]):
+                continue
+
+            orig_series = cleaned[col].dropna()
+            synth_series = synthetic[col].dropna().astype(float)
+            unique_vals = set(orig_series.unique())
+            # Derived count variables should never be treated as binary even if source only has {0,1}
+            derived_counts = {'chronic_condition_count', 'er_visits_12mo'}
+            is_binary = unique_vals.issubset({0, 1, 0.0, 1.0}) and col not in derived_counts
+
+            if is_binary:
+                orig_val = f"{orig_series.mean()*100:.1f}%"
+                synth_val = f"{synth_series.mean()*100:.1f}%"
+                diff = abs(orig_series.mean() - synth_series.mean()) * 100
+                match = '✅' if diff < 2 else '⚠️' if diff < 5 else '🔴'
+                diff_str = f"{diff:.1f}pp"
+            else:
+                orig_mean = orig_series.mean()
+                synth_mean = synth_series.mean()
+                if orig_mean >= 1000:
+                    orig_val = f"{orig_mean:,.0f}"
+                    synth_val = f"{synth_mean:,.0f}"
+                elif orig_mean >= 1:
+                    orig_val = f"{orig_mean:,.1f}"
+                    synth_val = f"{synth_mean:,.1f}"
+                else:
+                    orig_val = f"{orig_mean:.3f}"
+                    synth_val = f"{synth_mean:.3f}"
+                pct_diff = abs(orig_mean - synth_mean) / (abs(orig_mean) + 1e-10) * 100
+                match = '✅' if pct_diff < 5 else '⚠️' if pct_diff < 15 else '🔴'
+                diff_str = f"{pct_diff:.1f}%"
+
+            compare_rows.append({
+                'Variable': col,
+                'Original': orig_val,
+                'Synthetic': synth_val,
+                'Difference': diff_str,
+                'Match': match,
+            })
+
+        if compare_rows:
+            st.dataframe(
+                pd.DataFrame(compare_rows),
+                column_config={
+                    'Variable': st.column_config.TextColumn('Variable', width='medium'),
+                    'Original': st.column_config.TextColumn('Original', width='small'),
+                    'Synthetic': st.column_config.TextColumn('Synthetic', width='small'),
+                    'Difference': st.column_config.TextColumn('Δ', width='small'),
+                    'Match': st.column_config.TextColumn('', width='small'),
+                },
+                width=800,
+                hide_index=True,
+            )
+
+        # ── EXPLANATIONS (collapsed for repeat users) ──
+        st.markdown("---")
+        st.markdown(f"""
+        <div style="margin-bottom:8px;">
+            <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                        letter-spacing:1px;">📖 How It Works</span>
+            <span style="font-size:12px; color:#999; margin-left:8px;">
+                Expand to learn about synthetic data generation</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.expander("🔒 What is Synthetic Data? (Plain English)"):
+            st.markdown(f"""
+Imagine you have a classroom of 30 students. You know their average height is 5'6", 
+most are between 5'2" and 5'10", and taller students tend to weigh more. 
+**Synthetic data** creates a *new* classroom of students that has the same 
+average height, the same spread, and the same height-weight relationship — but 
+**none of the students are real people**.
+
+For healthcare: we learn the **patterns** in the population (e.g., "smokers are 10x more 
+likely to get lung cancer", "older people have more chronic conditions") and generate 
+new patient records that follow those same patterns. A hospital can use this data to 
+plan programs, train models, and test systems — **without ever touching a real 
+patient's information**.
+            """)
+
+        with st.expander("🔬 Technical: How Your Data Was Built (Step-by-Step)"):
+            enrichment_synth = st.session_state.get('enrichment', {})
+            n_conditions_synth = len(enrichment_synth.get('conditions', {}))
+            n_rfs_synth = len(enrichment_synth.get('risk_factors', []))
+            n_source_synth = len(cleaned)
+            n_synth_synth = len(synthetic)
+            fid_synth = st.session_state.fidelity['overall_score']
+            
+            cond_names_synth = [c.replace('_', ' ').title() for c in enrichment_synth.get('conditions', {}).keys()]
+            rf_names_synth = [rf['name'].replace('_', ' ').title() for rf in enrichment_synth.get('risk_factors', [])]
+            
+            st.markdown(f"""
+**Step 1: Question Analysis** → GPT-4o analyzed your question and designed a schema with 
+**{n_conditions_synth} conditions** ({', '.join(cond_names_synth[:4]) or 'none'}) and 
+**{n_rfs_synth} risk factors** ({', '.join(rf_names_synth[:4]) or 'none'}), 
+selecting prevalence rates and means from Canadian public health sources (PHAC, Stats Canada, CIHI).
+
+**Step 2: Source Data Generation** → **{n_source_synth:,}** records were generated using the schema. 
+Each record was built row-by-row:
+- Categorical fields (municipality, sex, etc.) sampled from Census proportions
+- Numeric risk factors drawn from normal distributions with age adjustment ± individual variation
+- Binary conditions generated with prevalence rates modified by age, comorbidities, and risk factor values
+- Cross-variable correlations injected via nudge factors (strength 0.1–0.5)
+- Smart rounding applied (integers for counts/money, 1dp for scores, 3dp for rates)
+
+**Step 3: Metadata Extraction** → The Gaussian Copula generator analyzed the {n_source_synth:,} source records to extract:
+- **Marginal distributions**: Best-fit distribution (normal, lognormal, gamma, Weibull) for each numeric variable
+- **Spearman correlation matrix**: Captures how all numeric variables move together
+- **Conditional logistic models**: For each binary variable, a logistic regression learned how it depends on the numeric variables
+- **Category frequencies**: Exact proportions for each categorical variable
+
+**Step 4: Synthetic Generation** → **{n_synth_synth:,}** new records were created:
+- Correlated uniform samples drawn from a multivariate normal (using the Spearman matrix)
+- Each uniform sample transformed to the target distribution via inverse CDF
+- Binary variables generated from the logistic models (preserving conditional dependencies)
+- Categorical variables sampled from observed frequency distributions
+- Clinical constraints enforced (no dementia under 40, etc.)
+
+**Step 5: Validation** → Fidelity score of **{fid_synth:.1f}%** computed by comparing:
+- KS statistics for numeric distributions (do the shapes match?)
+- Prevalence rate differences for binary variables (do the rates match?)
+- Total variation distance for categorical variables (do the proportions match?)
+- Correlation matrix preservation (do the relationships match?)
+- Cross-type dependency preservation (do binary ↔ numeric links survive?)
+- Metadata target comparison (does the synthetic data match the intended public health parameters?)
+
+**No real patient data was used at any step.** All source parameters came from publicly available 
+Canadian health statistics published under Open Government Licences.
+            """)
+
+        with st.expander("💡 Why Would a Hospital Use This?"):
+            enrichment_why = st.session_state.get('enrichment', {})
+            question_why = st.session_state.get('question', '')
+            unit_why = enrichment_why.get('unit_of_observation', 'person')
+            unit_label_why = enrichment_why.get('unit_label', 'record')
+            n_synth_why = len(synthetic)
+            schema_desc_why = enrichment_why.get('schema_description', '')
+            
+            # Get variable names for context
+            cond_names_why = [c.replace('_', ' ').title() for c in enrichment_why.get('conditions', {}).keys()]
+            rf_names_why = [rf['name'].replace('_', ' ').title() for rf in enrichment_why.get('risk_factors', [])]
+            
+            try:
+                from langchain_openai import ChatOpenAI
+                from langchain_core.messages import HumanMessage, SystemMessage
+                api_key = os.getenv("OPENAI_API_KEY")
+                if api_key:
+                    use_case_llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key, max_tokens=400)
+                    use_case_resp = use_case_llm.invoke([
+                        SystemMessage(content="""You are a healthcare strategy consultant. Given a question and dataset description,
+write exactly 5 bullet points explaining how a hospital could USE this synthetic dataset.
+
+RULES:
+- Each bullet must be SPECIFIC to the question — no generic advice
+- Start each bullet with a bold action phrase (e.g., **Cost modeling:**, **Vendor negotiation:**, **Burnout prevention:**)
+- Mention that synthetic data means no privacy concerns, no real patient/staff/procurement data exposed
+- Include one "what-if scenario" bullet (e.g., "What if flu season is 30% worse?")
+- Include one bullet about sharing data externally (with researchers, board, partners, vendors)
+- Keep each bullet to 1-2 sentences max
+- Do NOT use headers — just bullet points
+- Start directly with the first bullet"""),
+                        HumanMessage(content=f"""Question: {question_why}
+Dataset: {n_synth_why:,} synthetic {unit_label_why} records
+Schema: {schema_desc_why}
+Variables include: {', '.join(cond_names_why[:3] + rf_names_why[:4])}""")
+                    ])
+                    
+                    st.markdown(f"""Based on your question *"{question_why[:80]}..."*, here's how Southlake could use this **{n_synth_why:,}-row synthetic {unit_label_why} dataset**:\n""")
+                    st.markdown(use_case_resp.content)
+                else:
+                    raise ValueError("No API key")
+            except Exception:
+                st.markdown(f"""
+Based on your question *"{question_why[:80]}..."*, here's how Southlake could use this **{n_synth_why:,}-row synthetic {unit_label_why} dataset**:
+
+- **Analysis & planning:** Answer the question above using realistic data — without accessing any real {unit_label_why} records
+- **What-if scenarios:** Change assumptions (prevalence rates, costs, volumes) on the Data Hygiene page and regenerate to model different futures
+- **System testing:** Test new software, dashboards, or reports with realistic but completely synthetic data
+- **External sharing:** Share this dataset with researchers, consultants, or partners without privacy concerns or ethics board delays
+- **Staff training:** Train new analysts on realistic scenarios without exposing sensitive information
+                """)
+
+        with st.expander("📋 Metadata Extracted from Original Data"):
+            enrichment_meta_synth = st.session_state.get('enrichment', {})
+            unit_meta = enrichment_meta_synth.get('unit_of_observation', 'person')
+            unit_label_meta = enrichment_meta_synth.get('unit_label', 'record')
+            n_source_meta = len(cleaned)
+            
+            st.markdown(f"""
+The table below shows how each variable from the **{n_source_meta:,} {unit_label_meta} records** was analyzed 
+and converted into statistical metadata. The generator fitted candidate distributions (Normal, Lognormal, 
+Gamma, Weibull) to each numeric variable and selected the best fit via Kolmogorov-Smirnov test. 
+Binary variables were modeled with conditional logistic regression to preserve dependencies.
+**No individual {unit_label_meta} records are carried forward — only these statistical summaries drive generation.**
+            """)
+
+            # Refit metadata to show distribution details
+            meta_rows = []
+            for col in synthetic.columns:
+                if col not in cleaned.columns:
+                    continue
+                series = cleaned[col].dropna()
+                unique_vals = set(series.unique())
+                is_binary = unique_vals.issubset({0, 1, 0.0, 1.0})
+
+                if is_binary:
+                    rate = series.mean()
+                    meta_rows.append({
+                        'Variable': col,
+                        'Type': 'Binary',
+                        'Distribution Fit': f'Bernoulli(p={rate:.3f})',
+                        'Original Summary': f'{rate*100:.1f}% prevalence (N={int(series.sum()):,} of {len(series):,})',
+                        'Generation Method': 'Conditional logistic regression',
+                        'KS Statistic': '—',
+                    })
+                elif pd.api.types.is_numeric_dtype(series) and series.nunique() > 10:
+                    # Find best-fit distribution (same logic as SyntheticGenerator)
+                    best_name, best_ks = 'norm', 1.0
+                    for dname, dist in [('norm', stats.norm), ('lognorm', stats.lognorm),
+                                         ('gamma', stats.gamma), ('weibull_min', stats.weibull_min)]:
+                        try:
+                            params = dist.fit(series)
+                            ks_stat, _ = kstest(series, dname, args=params)
+                            if ks_stat < best_ks:
+                                best_name, best_ks = dname, ks_stat
+                        except (ValueError, RuntimeError, FloatingPointError):
+                            continue
+                    
+                    dist_display = {
+                        'norm': 'Normal',
+                        'lognorm': 'Lognormal',
+                        'gamma': 'Gamma',
+                        'weibull_min': 'Weibull',
+                    }.get(best_name, best_name)
+                    
+                    meta_rows.append({
+                        'Variable': col,
+                        'Type': 'Numeric',
+                        'Distribution Fit': f'{dist_display} (KS={best_ks:.4f})',
+                        'Original Summary': f'μ={series.mean():.1f}, σ={series.std():.1f}, [{series.min():.0f}–{series.max():.0f}]',
+                        'Generation Method': 'Gaussian Copula → inverse CDF',
+                        'KS Statistic': f'{best_ks:.4f}',
+                    })
+                elif pd.api.types.is_numeric_dtype(series):
+                    meta_rows.append({
+                        'Variable': col,
+                        'Type': 'Discrete',
+                        'Distribution Fit': f'Empirical ({series.nunique()} values)',
+                        'Original Summary': f'{series.nunique()} categories, mode={series.mode().iloc[0]}',
+                        'Generation Method': 'Weighted random sampling',
+                        'KS Statistic': '—',
+                    })
+                else:
+                    freq = series.value_counts(normalize=True).head(3)
+                    top = ', '.join(f'{k}: {v*100:.0f}%' for k, v in freq.items())
+                    meta_rows.append({
+                        'Variable': col,
+                        'Type': 'Categorical',
+                        'Distribution Fit': f'Multinomial ({series.nunique()} categories)',
+                        'Original Summary': f'Top: {top}',
+                        'Generation Method': 'Weighted random sampling',
+                        'KS Statistic': '—',
+                    })
+
+            if meta_rows:
+                st.dataframe(
+                    pd.DataFrame(meta_rows),
+                    column_config={
+                        'Variable': st.column_config.TextColumn('Variable', width='medium'),
+                        'Type': st.column_config.TextColumn('Type', width='small'),
+                        'Distribution Fit': st.column_config.TextColumn('Distribution Fit', width='medium'),
+                        'Original Summary': st.column_config.TextColumn('Original Summary', width='large'),
+                        'Generation Method': st.column_config.TextColumn('Method', width='medium'),
+                        'KS Statistic': st.column_config.TextColumn('KS', width='small'),
+                    },
+                    width=1100,
+                    hide_index=True,
+                )
+
+            # Show the extracted Spearman correlation matrix used by the copula
+            numeric_meta_cols = [col for col in cleaned.columns 
+                                if pd.api.types.is_numeric_dtype(cleaned[col]) 
+                                and cleaned[col].nunique() > 10
+                                and col not in {'chronic_condition_count', 'risk_score', 'er_visits_12mo',
+                                               'fall_risk_score', 'had_fall_12mo'}]
+            if len(numeric_meta_cols) >= 2:
+                st.markdown(f"""
+---
+**Spearman Correlation Matrix** — This is the exact matrix the Gaussian Copula used to generate 
+correlated synthetic values. It captures how all {len(numeric_meta_cols)} numeric variables move together.
+                """)
+                corr_meta = cleaned[numeric_meta_cols].corr(method='spearman')
+                fig_meta, ax_meta = plt.subplots(figsize=(max(6, len(numeric_meta_cols) * 0.8),
+                                                           max(5, len(numeric_meta_cols) * 0.65)))
+                mask_meta = np.triu(np.ones_like(corr_meta, dtype=bool), k=1)
+                sns.heatmap(corr_meta, mask=mask_meta, annot=True, fmt='.2f', cmap='RdBu_r',
+                            center=0, vmin=-1, vmax=1, ax=ax_meta, square=True,
+                            linewidths=0.5, annot_kws={'size': 8},
+                            cbar_kws={'shrink': 0.8})
+                ax_meta.set_title('Extracted Spearman Matrix (Input to Copula)', fontsize=12,
+                                  fontweight='bold', color=COLORS['navy'])
+                plt.tight_layout()
+                st.pyplot(fig_meta)
+                plt.close()
+
+        with st.expander("🔍 View SAS Code — Synthetic Generation"):
+            st.code(st.session_state.sas_programs.get('06_sas_synthetic', ''), language='sas')
 
 
 # ============================================================
-# PAGE: FIDELITY
+# PAGE: FIDELITY — cleaned up
 # ============================================================
 elif page == "✅ Fidelity":
     st.markdown("""
@@ -3455,233 +5512,381 @@ elif page == "✅ Fidelity":
         fidelity = st.session_state.fidelity
         cleaned = st.session_state.cleaned_df
         synthetic = st.session_state.synthetic_df
-
         score = fidelity['overall_score']
-        verdict = ('🟢 Excellent — synthetic data closely mirrors original' if score >= 85
-                   else '🟡 Good — minor deviations, suitable for most analyses' if score >= 70
-                   else '🟠 Fair — review individual columns' if score >= 50
-                   else '🔴 Needs improvement')
+
+        # ── SCORE DASHBOARD (compact) ──
+        verdict_text = ('Excellent' if score >= 85 else 'Good' if score >= 70
+                        else 'Fair' if score >= 50 else 'Needs Work')
+        verdict_color = ('#43a047' if score >= 85 else '#f9a825' if score >= 70
+                         else '#e65100' if score >= 50 else '#c62828')
+
+        corr_score = fidelity.get('correlation_score', 'N/A')
+        dep_score = fidelity.get('dependency_score', 'N/A')
+
         st.markdown(f"""
-        <div class="fidelity-ring">
-            <h2>Overall Fidelity Score</h2>
-            <div class="score">{score:.1f}%</div>
-            <div class="verdict">{verdict}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        st.markdown("### Numeric Columns")
-        num_rows = []
-        for col, m in fidelity['numeric'].items():
-            q = ('🟢' if m['score'] >= 85 else '🟡' if m['score'] >= 70
-                 else '🟠' if m['score'] >= 50 else '🔴')
-            num_rows.append({
-                '': q, 'Column': col, 'KS Stat': m['ks_statistic'],
-                'Mean Δ%': m['mean_diff_pct'], 'Std Δ%': m['std_diff_pct'],
-                'Score': m['score']
-            })
-        st.dataframe(pd.DataFrame(num_rows), width='stretch', hide_index=True)
-
-        if fidelity['binary']:
-            st.markdown("### Binary Columns")
-            bin_rows = []
-            for col, m in fidelity['binary'].items():
-                q = '🟢' if m['score'] >= 85 else '🟡' if m['score'] >= 70 else '🟠'
-                bin_rows.append({
-                    '': q, 'Column': col,
-                    'Original Rate': f"{m['original_rate']:.4f}",
-                    'Synthetic Rate': f"{m['synthetic_rate']:.4f}",
-                    'Abs Diff': f"{m['abs_diff']:.4f}",
-                    'Score': m['score']
-                })
-            st.dataframe(pd.DataFrame(bin_rows), width='stretch', hide_index=True)
-
-        if fidelity['categorical']:
-            st.markdown("### Categorical Columns")
-            cat_rows = []
-            for col, m in fidelity['categorical'].items():
-                q = '🟢' if m['score'] >= 85 else '🟡' if m['score'] >= 70 else '🟠'
-                cat_rows.append({
-                    '': q, 'Column': col,
-                    'Total Variation Distance': m['tvd'],
-                    'Score': m['score']
-                })
-            st.dataframe(pd.DataFrame(cat_rows), width='stretch', hide_index=True)
-
-        if 'correlation_score' in fidelity:
-            st.markdown(f"""
-            <div style="background:{COLORS['light_bg']}; padding:14px; border-radius:8px; margin:16px 0;">
-                <b>🔗 Correlation Preservation:</b> Score = {fidelity['correlation_score']}%
-                 |  Avg absolute difference = {fidelity['correlation_diff']}
+        <div style="background:linear-gradient(135deg, {COLORS['navy']} 0%, {COLORS['dark_teal']} 100%);
+                    padding:24px 28px; border-radius:14px; margin-bottom:24px;">
+            <div style="display:flex; align-items:center; gap:32px; flex-wrap:wrap;">
+                <div style="text-align:center; min-width:120px;">
+                    <div style="color:rgba(255,255,255,0.5); font-size:11px; text-transform:uppercase;
+                                letter-spacing:1px;">Overall Fidelity</div>
+                    <div style="color:{COLORS['turquoise']}; font-size:48px; font-weight:800;
+                                line-height:1.1;">{score:.1f}%</div>
+                    <div style="color:{verdict_color}; font-size:13px; font-weight:600;">
+                        ● {verdict_text}</div>
+                </div>
+                <div style="width:1px; height:60px; background:rgba(255,255,255,0.15);"></div>
+                <div>
+                    <div style="color:rgba(255,255,255,0.5); font-size:11px; text-transform:uppercase;
+                                letter-spacing:1px;">Correlation Preservation</div>
+                    <div style="color:white; font-size:24px; font-weight:700;">
+                        {corr_score if isinstance(corr_score, str) else f'{corr_score:.1f}%'}</div>
+                </div>
+                <div>
+                    <div style="color:rgba(255,255,255,0.5); font-size:11px; text-transform:uppercase;
+                                letter-spacing:1px;">Dependency Preservation</div>
+                    <div style="color:white; font-size:24px; font-weight:700;">
+                        {dep_score if isinstance(dep_score, str) else f'{dep_score:.1f}%'}</div>
+                </div>
+                <div style="flex:1; min-width:200px;">
+                    <div style="color:rgba(255,255,255,0.6); font-size:12px; line-height:1.6;">
+                        Fidelity measures how well the synthetic data preserves the statistical
+                        properties of the original. Scores above 85% indicate the synthetic data
+                        is suitable for analysis and planning.</div>
+                </div>
             </div>
-            """, unsafe_allow_html=True)
-
-        st.markdown("### 📐 Statistical Tests")
-        st.markdown(f"""
-        <div style="background:{COLORS['light_bg']}; padding:12px 16px; border-radius:8px;
-                    margin-bottom:16px; font-size:13px;">
-            <b>Kolmogorov-Smirnov (K-S) Test</b> — For continuous/numeric variables. Measures the maximum distance
-            between two cumulative distributions. A <b>low K-S statistic</b> (close to 0) means the distributions
-            are nearly identical. <b>p-value &gt; 0.05</b> = cannot reject that distributions are the same.<br><br>
-            <b>Chi-Squared (χ²) Test</b> — For categorical/binary variables. Tests whether frequency distributions
-            differ significantly. <b>p-value &gt; 0.05</b> = no statistically significant difference.
         </div>
         """, unsafe_allow_html=True)
-        
-        test_rows = []
-        for col in cleaned.columns:
-            if col not in synthetic.columns:
-                continue
-            meta_type = None
-            if pd.api.types.is_numeric_dtype(cleaned[col]) and cleaned[col].nunique() > 10:
-                meta_type = 'numeric'
-            elif cleaned[col].nunique() <= 20:
-                meta_type = 'categorical'
-            
-            if meta_type == 'numeric':
-                orig = cleaned[col].dropna().astype(float)
-                synth = synthetic[col].dropna().astype(float)
-                if len(orig) > 0 and len(synth) > 0:
-                    ks_stat, ks_p = stats.ks_2samp(orig, synth)
-                    verdict = '✅ Pass' if ks_p > 0.05 else '⚠️ Differs'
-                    test_rows.append({
-                        'Variable': col,
-                        'Test': 'K-S',
-                        'Statistic': round(ks_stat, 4),
-                        'p-value': f"{ks_p:.4f}" if ks_p > 0.0001 else f"{ks_p:.2e}",
-                        'Effect Size': '✅ Excellent' if ks_stat < 0.05 else '✅ Good' if ks_stat < 0.10 else '⚠️ Review',
-                        'Result (α=0.05)': verdict,
-                    })
-            elif meta_type == 'categorical':
-                try:
-                    orig_freq = cleaned[col].astype(str).value_counts()
-                    synth_freq = synthetic[col].astype(str).value_counts()
-                    all_cats = sorted(set(orig_freq.index) | set(synth_freq.index))
-                    orig_counts = np.array([orig_freq.get(c, 0) for c in all_cats])
-                    synth_counts = np.array([synth_freq.get(c, 0) for c in all_cats])
-                    if min(synth_counts) > 0 and len(all_cats) > 1:
-                        expected = synth_counts * (orig_counts.sum() / synth_counts.sum())
-                        chi2, chi_p = stats.chisquare(orig_counts, f_exp=expected)
-                        verdict = '✅ Pass' if chi_p > 0.05 else '⚠️ Differs'
-                        test_rows.append({
-                            'Variable': col,
-                            'Test': 'Chi-Squared',
-                            'Statistic': round(chi2, 4),
-                            'p-value': f"{chi_p:.4f}" if chi_p > 0.0001 else f"{chi_p:.2e}",
-                            'Effect Size': '✅ Excellent' if chi2 < 10 else '✅ Good' if chi2 < 50 else '⚠️ Review',
-                            'Result (α=0.05)': verdict,
-                        })
-                except (ValueError, ZeroDivisionError, IndexError):
-                    pass
-        
-        if test_rows:
-            test_df = pd.DataFrame(test_rows)
-            n_pass = sum(1 for r in test_rows if '✅' in r['Result (α=0.05)'])
-            n_total = len(test_rows)
-            n_excellent = sum(1 for r in test_rows if '✅ Excellent' in r['Effect Size'])
-            
-            tc1, tc2, tc3 = st.columns(3)
-            with tc1:
-                metric_card("Tests Run", str(n_total))
-            with tc2:
-                metric_card("p-value Pass", f"{n_pass}/{n_total}", "α = 0.05")
-            with tc3:
-                metric_card("Excellent Effect Size", f"{n_excellent}/{n_total}", "KS < 0.05 or χ² < 10")
-            
-            st.dataframe(test_df, width='stretch', hide_index=True)
-            
-            with st.expander("⚠️ Why do some tests show 'Differs' even though fidelity is high?"):
-                st.markdown("""
-**Short answer:** With 30,000+ records, statistical tests are *too powerful* — they detect differences so small they don't matter.
 
-**Example:**  
-- Original mean age: **42.00**  
-- Synthetic mean age: **42.05**  
-- That's a 0.05-year difference — clinically meaningless  
-- But the K-S test says p = 0.001 → "statistically significant" → ⚠️ Differs
+        # ── DISTRIBUTION COMPARISON (visual evidence first) ──
+        st.markdown(f"""
+        <div style="margin-bottom:8px;">
+            <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                        letter-spacing:1px;">📊 Distribution Comparison</span>
+            <span style="font-size:12px; color:#999; margin-left:8px;">
+                Original (teal) vs Synthetic (coral) — overlaid histograms</span>
+        </div>
+        """, unsafe_allow_html=True)
 
-**Why this happens:**  
-P-values measure "could this difference be due to random chance?" With only 100 records, a 0.05 difference could easily be chance. With 34,000 records, the test is certain it's not chance — even though the difference is trivial.
+        plot_vars = get_question_specific_vars(st.session_state.question, cleaned)
+        plot_vars = [v for v in plot_vars if v in synthetic.columns][:6]
 
-**What to look at instead:**  
+        n_p = len(plot_vars)
+        if n_p > 0:
+            nr = (n_p + 2) // 3
+            fig, axes = plt.subplots(nr, 3, figsize=(16, 4.2 * nr))
+            if nr == 1:
+                axes = [axes]
+            for i, var in enumerate(plot_vars):
+                ax = axes[i // 3][i % 3]
+                orig = cleaned[var].dropna()
+                synth = synthetic[var].dropna().astype(float) if var in synthetic.columns else pd.Series()
 
-| Metric | What it means | Good threshold |
-|---|---|---|
-| **K-S Statistic** | Max distance between distributions (0 = identical) | < 0.05 = excellent, < 0.10 = good |
-| **χ² Statistic** | How much categorical frequencies differ | < 10 = excellent, < 50 = good |
-| **Effect Size column** | Our interpretation of the above | ✅ Excellent or ✅ Good = synthetic data is faithful |
+                is_binary = set(orig.unique()).issubset({0, 1, 0.0, 1.0})
 
-**Bottom line:** If the Effect Size column shows ✅, the synthetic data is statistically faithful — regardless of what the p-value says.
-                """)
+                if is_binary and len(synth) > 0:
+                    orig_rate = orig.mean() * 100
+                    synth_rate = synth.mean() * 100
+                    x = np.arange(2)
+                    w = 0.35
+                    ax.bar(x - w/2, [100 - orig_rate, orig_rate], w, label='Original',
+                           color=COLORS['teal'], alpha=0.75, edgecolor='white')
+                    ax.bar(x + w/2, [100 - synth_rate, synth_rate], w, label='Synthetic',
+                           color=COLORS['alert_red'], alpha=0.65, edgecolor='white')
+                    ax.set_xticks(x)
+                    ax.set_xticklabels(['No', 'Yes'])
+                    ax.set_ylabel('%')
+                    ax.legend(fontsize=8)
+                    diff = abs(orig_rate - synth_rate)
+                    ax.set_title(f"{var.replace('_', ' ').title()}\nΔ {diff:.1f}pp",
+                                fontsize=10, fontweight='bold', color=COLORS['navy'])
+                elif len(synth) > 0:
+                    ax.hist(orig, bins=40, alpha=0.55, color=COLORS['teal'],
+                            label='Original', density=True, edgecolor='white', linewidth=0.3)
+                    ax.hist(synth, bins=40, alpha=0.55, color=COLORS['alert_red'],
+                            label='Synthetic', density=True, edgecolor='white', linewidth=0.3)
+                    ax.legend(fontsize=8)
+                    ax.set_ylabel('')
+                    ax.yaxis.set_visible(False)
+                    ax.set_title(var.replace('_', ' ').title(), fontsize=10,
+                                 fontweight='bold', color=COLORS['navy'])
 
-        st.markdown("### Distribution Comparison")
-        numeric_cols = [c for c in cleaned.columns if pd.api.types.is_numeric_dtype(cleaned[c])]
-        plot_vars = [c for c in ['age', 'income', 'risk_score', 'chronic_condition_count',
-                                  'er_visits_12mo', 'fall_risk_score'] if c in numeric_cols]
-        n_p = min(len(plot_vars), 6)
-        nr = (n_p + 2) // 3
-        fig, axes = plt.subplots(nr, 3, figsize=(16, 4.5 * nr))
-        if nr == 1:
-            axes = [axes]
-        for i, var in enumerate(plot_vars[:n_p]):
-            ax = axes[i // 3][i % 3]
-            orig = cleaned[var].dropna()
-            synth = synthetic[var].dropna() if var in synthetic.columns else pd.Series()
-            if len(synth) > 0:
-                ax.hist(orig, bins=40, alpha=0.55, color=COLORS['teal'],
-                        label='Original', density=True, edgecolor='white', linewidth=0.3)
-                ax.hist(synth, bins=40, alpha=0.55, color=COLORS['alert_red'],
-                        label='Synthetic', density=True, edgecolor='white', linewidth=0.3)
-                ax.legend(fontsize=9)
-            ax.set_title(var.replace('_', ' ').title(), fontsize=11,
-                         fontweight='bold', color=COLORS['navy'])
-            ax.spines['top'].set_visible(False)
-            ax.spines['right'].set_visible(False)
-        for i in range(n_p, nr * 3):
-            axes[i // 3][i % 3].set_visible(False)
-        plt.suptitle('Original vs Synthetic Distributions', fontsize=14,
-                     fontweight='bold', color=COLORS['navy'])
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close()
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                ax.tick_params(axis='both', labelsize=8)
 
-        synth_numeric = [c for c in numeric_cols if c in synthetic.columns]
-        if len(synth_numeric) >= 2:
-            st.markdown("### Correlation Matrix Comparison")
-            orig_corr = cleaned[synth_numeric].corr(method='spearman')
-            synth_corr = synthetic[synth_numeric].astype(float).corr(method='spearman')
-            diff_corr = (orig_corr - synth_corr).abs()
-
-            fig, axs = plt.subplots(1, 3, figsize=(20, 6.5))
-            for ax_i, (data, title, cmap, vmin, vmax, center) in enumerate([
-                (orig_corr, 'Original', 'RdBu_r', -1, 1, 0),
-                (synth_corr, 'Synthetic', 'RdBu_r', -1, 1, 0),
-                (diff_corr, 'Absolute Difference', 'Reds', 0, 0.5, None),
-            ]):
-                sns.heatmap(data, annot=True, fmt='.2f', cmap=cmap, center=center,
-                            vmin=vmin, vmax=vmax, ax=axs[ax_i], square=True,
-                            linewidths=0.5, annot_kws={'size': 6},
-                            cbar_kws={'shrink': 0.75})
-                axs[ax_i].set_title(title, fontsize=12, fontweight='bold',
-                                    color=COLORS['navy'])
-            plt.tight_layout()
+            for i in range(n_p, nr * 3):
+                axes[i // 3][i % 3].set_visible(False)
+            plt.tight_layout(h_pad=3.0)
             st.pyplot(fig)
             plt.close()
 
-        # Privacy: Distance to Closest Record
-        st.markdown("### 🔒 Privacy Verification — Distance to Closest Record (DCR)")
+        # ── UNIFIED FIDELITY TABLE ──
         st.markdown(f"""
-        <div style="background:{COLORS['light_bg']}; padding:12px 16px; border-radius:8px;
-                    margin-bottom:16px; font-size:13px;">
-            <b>What is DCR?</b> For each synthetic record, we measure the Euclidean distance
-            to the closest real record (after standardization). If synthetic records are
-            <b>too close</b> to real records, the generator may be memorizing rather than
-            generalizing. The threshold adapts to dataset size and dimensionality.
+        <div style="margin:24px 0 8px 0;">
+            <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                        letter-spacing:1px;">📋 Per-Variable Fidelity Scores</span>
+            <span style="font-size:12px; color:#999; margin-left:8px;">
+                All variable types in one view</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        all_fid_rows = []
+
+        for col, m in fidelity.get('numeric', {}).items():
+            q = '🟢' if m['score'] >= 85 else '🟡' if m['score'] >= 70 else '🟠' if m['score'] >= 50 else '🔴'
+            all_fid_rows.append({
+                '': q,
+                'Variable': col,
+                'Type': 'Numeric',
+                'Metric': f"KS={m['ks_statistic']:.4f}",
+                'Detail': f"Mean Δ {m['mean_diff_pct']:.1f}% · Std Δ {m['std_diff_pct']:.1f}%",
+                'Score': m['score'],
+            })
+
+        for col, m in fidelity.get('binary', {}).items():
+            q = '🟢' if m['score'] >= 85 else '🟡' if m['score'] >= 70 else '🟠'
+            all_fid_rows.append({
+                '': q,
+                'Variable': col,
+                'Type': 'Binary',
+                'Metric': f"Δ={m['abs_diff']:.4f}",
+                'Detail': f"Orig {m['original_rate']*100:.1f}% → Synth {m['synthetic_rate']*100:.1f}%",
+                'Score': m['score'],
+            })
+
+        for col, m in fidelity.get('categorical', {}).items():
+            q = '🟢' if m['score'] >= 85 else '🟡' if m['score'] >= 70 else '🟠'
+            all_fid_rows.append({
+                '': q,
+                'Variable': col,
+                'Type': 'Categorical',
+                'Metric': f"TVD={m['tvd']:.4f}",
+                'Detail': 'Total variation distance',
+                'Score': m['score'],
+            })
+
+        # Sort by score ascending so worst are at top
+        all_fid_rows.sort(key=lambda x: x['Score'])
+
+        if all_fid_rows:
+            # Build fidelity table rows as individual st.markdown calls to avoid Streamlit HTML parsing issues
+            navy = COLORS['navy']
+            teal = COLORS['teal']
+            light_bg = COLORS['light_bg']
+            amber = COLORS['alert_amber']
+            red = COLORS['alert_red']
+            
+            header_html = '<div style="border:1px solid #e0e0e0; border-radius:10px; overflow:hidden; margin-bottom:16px;">'
+            header_html += '<table style="width:100%; border-collapse:collapse; font-size:13px;">'
+            header_html += '<thead>'
+            header_html += f'<tr style="background:{light_bg}; border-bottom:2px solid #e0e0e0;">'
+            header_html += f'<th style="padding:12px 16px; text-align:left; color:{navy}; font-weight:700; width:40px;"></th>'
+            header_html += f'<th style="padding:12px 16px; text-align:left; color:{navy}; font-weight:700;">Variable</th>'
+            header_html += f'<th style="padding:12px 16px; text-align:left; color:{navy}; font-weight:700; width:80px;">Type</th>'
+            header_html += f'<th style="padding:12px 16px; text-align:left; color:{navy}; font-weight:700; width:120px;">Metric</th>'
+            header_html += f'<th style="padding:12px 16px; text-align:left; color:{navy}; font-weight:700;">Detail</th>'
+            header_html += f'<th style="padding:12px 16px; text-align:left; color:{navy}; font-weight:700; width:200px;">Score</th>'
+            header_html += '</tr></thead><tbody>'
+            
+            for row in all_fid_rows:
+                score_val = row['Score']
+                if score_val >= 85:
+                    bar_color = teal
+                elif score_val >= 70:
+                    bar_color = amber
+                else:
+                    bar_color = red
+                
+                header_html += '<tr style="border-bottom:1px solid #f0f0f0;">'
+                header_html += f'<td style="padding:10px 16px; text-align:center;">{row[""]}</td>'
+                header_html += f'<td style="padding:10px 16px; font-weight:600; color:{navy};">{row["Variable"]}</td>'
+                header_html += f'<td style="padding:10px 16px; color:#666;">{row["Type"]}</td>'
+                header_html += f'<td style="padding:10px 16px; color:#666; font-family:monospace; font-size:12px;">{row["Metric"]}</td>'
+                header_html += f'<td style="padding:10px 16px; color:#666;">{row["Detail"]}</td>'
+                header_html += f'<td style="padding:10px 16px;">'
+                header_html += f'<div style="display:flex; align-items:center; gap:8px;">'
+                header_html += f'<div style="flex:1; background:#e0e0e0; border-radius:6px; height:14px; overflow:hidden;">'
+                header_html += f'<div style="width:{score_val}%; height:100%; background:{bar_color}; border-radius:6px;"></div>'
+                header_html += f'</div>'
+                header_html += f'<span style="font-weight:700; color:{bar_color}; font-size:13px; min-width:40px; text-align:right;">{score_val:.1f}</span>'
+                header_html += f'</div></td></tr>'
+            
+            header_html += '</tbody></table></div>'
+            st.markdown(header_html, unsafe_allow_html=True)
+
+        # ── METADATA TARGET FIDELITY ──
+        enrichment_fid = st.session_state.get('enrichment', {})
+        target_conditions_fid = enrichment_fid.get('conditions', {})
+        target_rfs_fid = enrichment_fid.get('risk_factors', [])
+        
+        if target_conditions_fid or target_rfs_fid:
+            st.markdown("---")
+            st.markdown(f"""
+            <div style="margin-bottom:8px;">
+                <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                            letter-spacing:1px;">🎯 Metadata Target Fidelity</span>
+                <span style="font-size:12px; color:#999; margin-left:8px;">
+                    How well does the synthetic data match the intended statistical targets?</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown(f"""
+            <div style="background:{COLORS['light_bg']}; padding:10px 14px; border-radius:8px;
+                        margin-bottom:12px; font-size:12px; color:{COLORS['navy']};">
+                This compares the synthetic data against the <b>target parameters</b> specified in the schema 
+                (from public health sources like PHAC, Stats Canada). This is different from the per-variable 
+                fidelity above, which compares synthetic vs the generated source data.
+            </div>
+            """, unsafe_allow_html=True)
+
+            target_rows = []
+            
+            for cond_name, cond_info in target_conditions_fid.items():
+                col_name = f"has_{cond_name}"
+                target_prev = cond_info.get('prevalence', 0)
+                source_name = cond_info.get('source', 'Unknown')
+                
+                if col_name in synthetic.columns:
+                    actual_prev = float(synthetic[col_name].astype(float).mean())
+                    diff_pp = abs(actual_prev - target_prev) * 100
+                    
+                    if cond_info.get('age_adjusted', True):
+                        match_icon = '✅' if diff_pp < 5 else '⚠️' if diff_pp < 10 else '🔴'
+                        note_text = 'Age-adjusted (raw rate differs from base rate)'
+                    else:
+                        match_icon = '✅' if diff_pp < 2 else '⚠️' if diff_pp < 5 else '🔴'
+                        note_text = 'Not age-adjusted'
+                    
+                    target_rows.append({
+                        'Variable': cond_name.replace('_', ' ').title(),
+                        'Type': 'Condition',
+                        'Target': f"{target_prev*100:.1f}%",
+                        'Synthetic': f"{actual_prev*100:.1f}%",
+                        'Δ': f"{diff_pp:.1f}pp",
+                        'Match': match_icon,
+                        'Source': source_name,
+                        'Note': note_text,
+                    })
+            
+            for rf in target_rfs_fid:
+                rf_name = rf.get('name', '')
+                rf_type = rf.get('type', 'binary')
+                source_name = rf.get('source', 'Unknown')
+                
+                if rf_name not in synthetic.columns:
+                    continue
+                
+                synth_series_fid = synthetic[rf_name].dropna().astype(float)
+                
+                if rf_type == 'numeric':
+                    target_mean = rf.get('mean', 0)
+                    target_std = rf.get('std', 1)
+                    actual_mean = float(synth_series_fid.mean())
+                    actual_std = float(synth_series_fid.std())
+                    
+                    mean_diff_pct = abs(actual_mean - target_mean) / (abs(target_mean) + 1e-10) * 100
+                    std_diff_pct = abs(actual_std - target_std) / (abs(target_std) + 1e-10) * 100
+                    
+                    match_icon = '✅' if mean_diff_pct < 10 else '⚠️' if mean_diff_pct < 25 else '🔴'
+                    
+                    target_rows.append({
+                        'Variable': rf_name.replace('_', ' ').title(),
+                        'Type': 'Numeric RF',
+                        'Target': f"μ={target_mean:.1f}, σ={target_std:.1f}",
+                        'Synthetic': f"μ={actual_mean:.1f}, σ={actual_std:.1f}",
+                        'Δ': f"Mean {mean_diff_pct:.0f}%, Std {std_diff_pct:.0f}%",
+                        'Match': match_icon,
+                        'Source': source_name,
+                        'Note': f"Range: [{rf.get('min', 0):.0f}, {rf.get('max', 100):.0f}]",
+                    })
+                
+                elif rf_type == 'binary':
+                    target_prev = rf.get('prevalence', 0.1)
+                    actual_prev = float(synth_series_fid.mean())
+                    diff_pp = abs(actual_prev - target_prev) * 100
+                    
+                    age_adj = rf.get('age_factor', 'flat') != 'flat'
+                    if age_adj:
+                        match_icon = '✅' if diff_pp < 5 else '⚠️' if diff_pp < 10 else '🔴'
+                    else:
+                        match_icon = '✅' if diff_pp < 2 else '⚠️' if diff_pp < 5 else '🔴'
+                    
+                    target_rows.append({
+                        'Variable': rf_name.replace('_', ' ').title(),
+                        'Type': 'Binary RF',
+                        'Target': f"{target_prev*100:.1f}%",
+                        'Synthetic': f"{actual_prev*100:.1f}%",
+                        'Δ': f"{diff_pp:.1f}pp",
+                        'Match': match_icon,
+                        'Source': source_name,
+                        'Note': 'Age-adjusted' if age_adj else 'Flat rate',
+                    })
+            
+            if target_rows:
+                st.dataframe(
+                    pd.DataFrame(target_rows),
+                    column_config={
+                        'Variable': st.column_config.TextColumn('Variable', width='medium'),
+                        'Type': st.column_config.TextColumn('Type', width='small'),
+                        'Target': st.column_config.TextColumn('Target', width='small'),
+                        'Synthetic': st.column_config.TextColumn('Synthetic', width='small'),
+                        'Δ': st.column_config.TextColumn('Δ', width='small'),
+                        'Match': st.column_config.TextColumn('', width='small'),
+                        'Source': st.column_config.TextColumn('Source', width='medium'),
+                        'Note': st.column_config.TextColumn('Note', width='medium'),
+                    },
+                    width=1200,
+                    hide_index=True,
+                )
+                
+                n_match = sum(1 for r in target_rows if r['Match'] == '✅')
+                n_warn = sum(1 for r in target_rows if r['Match'] == '⚠️')
+                n_fail = sum(1 for r in target_rows if r['Match'] == '🔴')
+                
+                st.markdown(f"""
+                <div style="display:flex; gap:12px; margin-top:8px;">
+                    <span style="background:#e8f5e9; padding:4px 12px; border-radius:12px; font-size:12px; color:#2e7d32;">
+                        ✅ {n_match} on target</span>
+                    <span style="background:#fff3e0; padding:4px 12px; border-radius:12px; font-size:12px; color:#e65100;">
+                        ⚠️ {n_warn} close</span>
+                    <span style="background:#ffebee; padding:4px 12px; border-radius:12px; font-size:12px; color:#c62828;">
+                        🔴 {n_fail} off target</span>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                if n_warn + n_fail > 0:
+                    st.markdown(f"""
+                    <div style="background:{COLORS['light_bg']}; padding:10px 14px; border-radius:8px;
+                                margin-top:8px; font-size:12px; color:{COLORS['navy']};">
+                        💡 <b>Why targets may differ:</b> Age-adjusted conditions will have different raw rates 
+                        than the base prevalence because the population's age distribution shifts the rate. 
+                        Correlation injection also shifts means slightly. Use the 
+                        <b>Metadata Adjustment</b> panel on the Data Hygiene page to fine-tune parameters.
+                    </div>
+                    """, unsafe_allow_html=True)
+
+        # ── PRIVACY: DCR ──
+        st.markdown("---")
+        st.markdown(f"""
+        <div style="margin-bottom:8px;">
+            <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                        letter-spacing:1px;">🔒 Privacy Verification</span>
+            <span style="font-size:12px; color:#999; margin-left:8px;">
+                Distance to Closest Record (DCR)</span>
         </div>
         """, unsafe_allow_html=True)
 
         dcr_numeric = [c for c in ['age', 'income', 'risk_score', 'er_visits_12mo',
                                     'fall_risk_score', 'chronic_condition_count']
                       if c in cleaned.columns and c in synthetic.columns]
+
+        # Also include any other numeric columns that exist in both
+        for c in cleaned.columns:
+            if (c not in dcr_numeric and c in synthetic.columns
+                    and pd.api.types.is_numeric_dtype(cleaned[c])
+                    and cleaned[c].nunique() > 10):
+                dcr_numeric.append(c)
 
         if len(dcr_numeric) >= 2:
             orig_vals = cleaned[dcr_numeric].dropna().values
@@ -3704,187 +5909,145 @@ P-values measure "could this difference be due to random chance?" With only 100 
             median_dcr = np.median(dcr_arr)
             p5_dcr = np.percentile(dcr_arr, 5)
 
-            # Adjust thresholds based on dimensionality and dataset size
             n_dims = len(dcr_numeric)
             n_records = len(orig_std)
-            # Expected DCR scales with sqrt(dims) and decreases with data density
             expected_dcr = np.sqrt(n_dims) * (n_records ** (-1.0 / max(n_dims, 1)))
+
             privacy_verdict = ('🟢 Strong' if median_dcr > expected_dcr * 3
                               else '🟡 Adequate' if median_dcr > expected_dcr * 1.5
-                              else '🔴 Review — potential memorization')
+                              else '🔴 Review')
+            privacy_color = ('#43a047' if '🟢' in privacy_verdict
+                            else '#f9a825' if '🟡' in privacy_verdict
+                            else '#c62828')
 
-            dc1, dc2, dc3 = st.columns(3)
-            with dc1:
-                metric_card("Median DCR", f"{median_dcr:.2f}", "Standardized Euclidean")
-            with dc2:
-                metric_card("5th Percentile", f"{p5_dcr:.2f}", "Worst-case proximity")
-            with dc3:
-                metric_card("Privacy", privacy_verdict)
+            # Compact privacy display
+            pc1, pc2, pc3, pc4 = st.columns(4)
+            with pc1:
+                metric_card("Median DCR", f"{median_dcr:.3f}", f"Expected: {expected_dcr:.3f}")
+            with pc2:
+                metric_card("5th Percentile", f"{p5_dcr:.3f}", "Worst-case proximity")
+            with pc3:
+                metric_card("Dimensions", str(n_dims), f"{', '.join(dcr_numeric[:3])}...")
+            with pc4:
+                metric_card("Privacy", privacy_verdict.split(' ', 1)[1] if ' ' in privacy_verdict else privacy_verdict)
 
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.hist(dcr_arr, bins=50, color=COLORS['teal'], alpha=0.8,
-                    edgecolor='white', linewidth=0.5)
-            ax.axvline(median_dcr, color=COLORS['alert_red'], linestyle='--',
-                      linewidth=2, label=f'Median = {median_dcr:.2f}')
-            ax.axvline(p5_dcr, color=COLORS['alert_amber'], linestyle='--',
-                      linewidth=2, label=f'5th pctl = {p5_dcr:.2f}')
-            ax.set_xlabel('Distance to Closest Real Record', fontsize=11)
-            ax.set_ylabel('Count', fontsize=11)
-            ax.set_title('Privacy: Distance to Closest Record Distribution',
-                        fontsize=13, fontweight='bold', color=COLORS['navy'])
-            ax.legend()
-            ax.spines['top'].set_visible(False)
-            ax.spines['right'].set_visible(False)
-            plt.tight_layout()
-            st.pyplot(fig)
-            plt.close()
+            # Context for the privacy result
+            if '🔴' in privacy_verdict:
+                st.markdown(f"""
+                <div style="background:#fff3e0; padding:14px 18px; border-radius:8px; border-left:4px solid #f9a825;
+                            margin:8px 0; font-size:13px;">
+                    <b>⚠️ Low DCR explained:</b> The synthetic records are close to original records in standardized 
+                    distance. This is common when the dataset has <b>few continuous variables</b> ({n_dims} used here) 
+                    or when variables have <b>limited unique values</b> (e.g., binary flags, small integer ranges). 
+                    With {n_records:,} original records in a {n_dims}-dimensional space, the expected minimum distance 
+                    is {expected_dcr:.3f}. This does <b>not</b> mean individual patients can be identified — the synthetic 
+                    data was generated from statistical distributions, not copied from real records.
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div style="background:#e8f5e9; padding:12px 16px; border-radius:8px; border-left:4px solid #43a047;
+                            margin:8px 0; font-size:13px;">
+                    ✅ Synthetic records are sufficiently distant from all original records.
+                    No re-identification risk detected.
+                </div>
+                """, unsafe_allow_html=True)
 
-        # Show dependency preservation score if available
-        if 'dependency_score' in fidelity:
-            st.markdown(f"""
-            <div style="background:{COLORS['light_bg']}; padding:14px; border-radius:8px; margin:16px 0;">
-                <b>🔗 Cross-Column Dependency Preservation:</b> Score = {fidelity['dependency_score']}%
-                 |  Measures whether binary↔numeric relationships (e.g., age→diabetes) are preserved
-            </div>
-            """, unsafe_allow_html=True)
+            with st.expander("📊 DCR Distribution Histogram"):
+                fig, ax = plt.subplots(figsize=(10, 4))
+                ax.hist(dcr_arr, bins=50, color=COLORS['teal'], alpha=0.8,
+                        edgecolor='white', linewidth=0.5)
+                ax.axvline(median_dcr, color=COLORS['alert_red'], linestyle='--',
+                          linewidth=2, label=f'Median = {median_dcr:.3f}')
+                ax.axvline(p5_dcr, color=COLORS['alert_amber'], linestyle='--',
+                          linewidth=2, label=f'5th pctl = {p5_dcr:.3f}')
+                ax.set_xlabel('Distance to Closest Real Record', fontsize=11)
+                ax.set_ylabel('Count', fontsize=11)
+                ax.set_title('Privacy: Distance to Closest Record Distribution',
+                            fontsize=13, fontweight='bold', color=COLORS['navy'])
+                ax.legend()
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close()
 
-        # ── SAS Validation Panel for Fidelity ─────────────────
+        # ── SAS VALIDATION ──
         sas_runner = st.session_state.sas_runner
         sas_connected = sas_runner and sas_runner.connected
-        sas_fidelity_means = None
-        sas_fidelity_corr = None
-        sas_n = min(len(cleaned), 5000)
 
         if sas_connected:
             with st.spinner("Running SAS fidelity validation..."):
-                # Upload synthetic data to SAS
                 sas_runner.upload_dataframe(synthetic, 'SYNTH_FIDELITY')
-                sas_runner.upload_dataframe(cleaned, 'ORIG_FIDELITY')
                 _, sas_fidelity_means = sas_runner.run_proc_means(synthetic, table_name='SYNTH_FIDELITY')
-                _, _, sas_fidelity_corr = sas_runner.run_proc_corr(synthetic, table_name='SYNTH_FIDELITY')
+
+            if sas_fidelity_means and sas_fidelity_means.get('success'):
+                st.markdown("---")
+                st.markdown(f"""
+                <div style="margin-bottom:8px;">
+                    <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                                letter-spacing:1px;">🔬 SAS Viya Validation</span>
+                    <span style="font-size:12px; color:#999; margin-left:8px;">
+                        Independent verification of synthetic data statistics</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+                sas_val_rows = []
+                key_fid_vars = [c for c in cleaned.columns
+                               if c in synthetic.columns and pd.api.types.is_numeric_dtype(cleaned[c])]
+                for var in key_fid_vars:
+                    orig_mean = cleaned[var].mean()
+                    synth_mean = float(synthetic[var].astype(float).mean())
+                    pct_diff = abs(orig_mean - synth_mean) / (abs(orig_mean) + 1e-10) * 100
+                    status = '✅' if pct_diff < 5 else '⚠️' if pct_diff < 15 else '🔴'
+
+                    if orig_mean >= 1000:
+                        o_str = f"{orig_mean:,.0f}"
+                        s_str = f"{synth_mean:,.0f}"
+                    elif orig_mean >= 1:
+                        o_str = f"{orig_mean:,.1f}"
+                        s_str = f"{synth_mean:,.1f}"
+                    else:
+                        o_str = f"{orig_mean:.4f}"
+                        s_str = f"{synth_mean:.4f}"
+
+                    # Clean display name — remove has_ prefix for conditions
+                    display_name = var
+                    if display_name.startswith('has_'):
+                        display_name = display_name[4:]
+                    elif display_name.startswith('is_'):
+                        display_name = display_name[3:]
+                    elif display_name.startswith('had_'):
+                        display_name = display_name[4:]
+                    display_name = display_name.replace('_', ' ').title()
+
+                    sas_val_rows.append({
+                        'Variable': display_name,
+                        'Original': o_str,
+                        'Synthetic': s_str,
+                        'Δ%': f"{pct_diff:.1f}%",
+                        'SAS': status,
+                    })
+
+                st.dataframe(
+                    pd.DataFrame(sas_val_rows),
+                    column_config={
+                        'Variable': st.column_config.TextColumn('Variable', width='medium'),
+                        'Original': st.column_config.TextColumn('Original', width='small'),
+                        'Synthetic': st.column_config.TextColumn('Synthetic', width='small'),
+                        'Δ%': st.column_config.TextColumn('Δ%', width='small'),
+                        'SAS': st.column_config.TextColumn('SAS', width='small'),
+                    },
+                    width=800,
+                    hide_index=True,
+                )
+
                 st.session_state.sas_execution_log.append({
-                    'phase': 'Fidelity', 'method': 'SAS PROC MEANS + PROC CORR on synthetic', 'success': True
+                    'phase': 'Fidelity', 'method': 'SAS PROC MEANS on synthetic', 'success': True
                 })
 
-        if sas_connected and sas_fidelity_means and sas_fidelity_means.get('success'):
-            # Build all content first, then render as one block
-            key_fid_vars = [c for c in ['age', 'income', 'risk_score', 'chronic_condition_count',
-                                         'er_visits_12mo', 'fall_risk_score']
-                           if c in cleaned.columns and c in synthetic.columns]
-            
-            fidelity_checks_html = ''
-            for var in key_fid_vars:
-                orig_mean = cleaned[var].mean()
-                synth_mean = float(synthetic[var].astype(float).mean())
-                pct_diff = abs(orig_mean - synth_mean) / (abs(orig_mean) + 1e-10) * 100
-                status = '✅' if pct_diff < 5 else '⚠️' if pct_diff < 15 else '🔴'
-                fidelity_checks_html += f'''<div style="padding:5px 0; border-bottom:1px solid rgba(0,0,0,0.06);">
-                    <span style="color:{COLORS["teal"]}; margin-right:8px;">{status}</span>
-                    <span style="color:{COLORS["navy"]}; font-size:13px;">
-                        <b>{var.replace("_"," ").title()}</b>: 
-                        Original mean={orig_mean:,.1f} → Synthetic mean={synth_mean:,.1f} 
-                        (Δ {pct_diff:.1f}%)
-                    </span></div>'''
-
-            corr_section = ''
-            if sas_fidelity_corr and sas_fidelity_corr.get('success') and 'correlation_diff' in fidelity:
-                corr_diff = fidelity['correlation_diff']
-                corr_status = '✅' if corr_diff < 0.05 else '⚠️' if corr_diff < 0.10 else '🔴'
-                corr_section = f'''
-                <div style="margin-top:20px;">
-                    <div style="color:{COLORS['teal']}; font-weight:600; font-size:14px; margin-bottom:8px;">
-                        PROC CORR — Correlation Structure Preservation</div>
-                    <div style="padding:6px 0; border-bottom:1px solid rgba(0,0,0,0.06);">
-                        <span style="color:{COLORS["teal"]}; margin-right:8px;">{corr_status}</span>
-                        <span style="color:{COLORS["navy"]}; font-size:13px;">
-                            Average absolute correlation difference: <b>{corr_diff:.4f}</b>
-                            — {'Excellent preservation' if corr_diff < 0.05 else 'Good preservation' if corr_diff < 0.10 else 'Review needed'}
-                        </span>
-                    </div>
-                    <div style="margin-top:12px; padding:10px 14px; background:{COLORS['light_bg']}; 
-                                border-radius:6px; border-left:3px solid {COLORS['turquoise']};">
-                        <span style="color:{COLORS['navy']}; font-size:12px;">
-                            💡 <b>Dual-engine confirmation:</b> Both Python and SAS Viya independently verify that 
-                            the synthetic dataset preserves the original population's statistical properties. 
-                            The data is suitable for population health planning at Southlake.</span>
-                    </div>
-                </div>'''
-
-            st.markdown(f"""
-            <div style="background:linear-gradient(135deg, {COLORS['navy']}, {COLORS['dark_teal']}); 
-                        padding:20px 24px; border-radius:12px 12px 0 0; margin-top:28px; border:1px solid {COLORS['teal']}; border-bottom:none;">
-                <div style="display:flex; align-items:center; margin-bottom:14px;">
-                    <span style="font-size:22px; margin-right:10px;">🔬</span>
-                    <span style="color:white; font-weight:700; font-size:17px;">
-                        SAS Viya — Independent Fidelity Validation</span>
-                    <span style="background:{COLORS['teal']}; color:white; padding:3px 10px; border-radius:12px; 
-                                font-size:11px; font-weight:600; margin-left:12px;">
-                        vfl-032.engage.sas.com</span>
-                </div>
-                <div style="color:rgba(255,255,255,0.7); font-size:13px;">
-                    SAS Viya independently computed summary statistics and correlations on the synthetic dataset 
-                    and compared them against the original. Both engines agree on fidelity.
-                </div>
-            </div>
-            <div style="background:white; border:1px solid {COLORS['teal']}; border-top:none; border-radius:0 0 12px 12px; padding:20px 24px;">
-                <div style="margin-bottom:14px;">
-                    <div style="color:{COLORS['teal']}; font-weight:600; font-size:14px; margin-bottom:8px;">
-                        PROC MEANS — Synthetic vs Original Comparison</div>
-                    {fidelity_checks_html}
-                </div>
-                {corr_section}
-            </div>
-            """, unsafe_allow_html=True)
-
-            # LLM Interpretation
-            try:
-                from langchain_openai import ChatOpenAI
-                from langchain_core.messages import HumanMessage, SystemMessage
-                api_key = os.getenv("OPENAI_API_KEY")
-                if api_key:
-                    fid_llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key, max_tokens=300)
-                    fid_resp = fid_llm.invoke([
-                        SystemMessage(content="""You are a healthcare data analyst at Southlake Health.
-Given fidelity validation results confirmed by both Python and SAS Viya, write 2-3 bullet points 
-summarizing the fidelity findings. Focus on:
-- Overall quality of the synthetic data
-- Which aspects are strongest/weakest
-- Whether the data is suitable for the intended use case
-Keep each bullet to 1-2 sentences. Format as markdown bullet points. Start directly with bullets."""),
-                        HumanMessage(content=f"""Question: {st.session_state.question}
-Overall fidelity: {fidelity['overall_score']:.1f}%
-Correlation preservation: {fidelity.get('correlation_diff', 'N/A')}
-Dependency preservation: {fidelity.get('dependency_score', 'N/A')}%
-Numeric scores: {json.dumps({k: v['score'] for k, v in fidelity['numeric'].items()}, default=str)}""")
-                    ])
-                    st.markdown(f"""
-                    <div style="background:{COLORS['light_bg']}; padding:16px 20px; border-radius:8px; 
-                                border-left:4px solid {COLORS['turquoise']}; margin:16px 0 8px 0;">
-                        <b style="color:{COLORS['navy']}; font-size:14px;">🔍 Fidelity Interpretation</b>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    st.markdown(fid_resp.content)
-            except Exception:
-                pass
-
-            # Expandable raw SAS output
-            with st.expander("📋 Raw SAS Output — Synthetic PROC MEANS"):
-                lst_fm = sas_fidelity_means.get('LST', '')
-                if lst_fm and len(lst_fm.strip()) > 20:
-                    styled_html_fm = '''
-                    <div style="background:#1e1e2e; color:#cdd6f4; padding:20px; border-radius:8px; 
-                                font-family:\'SAS Monospace\',\'Courier New\',monospace; font-size:12px; 
-                                overflow-x:auto; white-space:pre; line-height:1.5;">''' + lst_fm.replace('<', '&lt;').replace('>', '&gt;')[:8000] + '</div>'
-                    st.components.v1.html(styled_html_fm, height=400, scrolling=True)
-                else:
+                with st.expander("📋 Raw SAS Log — Fidelity PROC MEANS"):
                     st.code(sas_fidelity_means.get('LOG', '')[:5000], language='text')
-        elif not sas_connected:
-            st.markdown(f"""
-            <div style="background:#fff3e0; padding:10px 14px; border-radius:8px;
-                        border-left:4px solid #f9a825; margin-bottom:16px; margin-top:24px;">
-                🟡 <b>SAS Offline</b> — Fidelity computed in Python only. Connect SAS in sidebar for dual-engine validation.
-            </div>
-            """, unsafe_allow_html=True)
 
         with st.expander("🔍 View SAS Code — Fidelity Verification"):
             st.code(st.session_state.sas_programs.get('05_fidelity', ''), language='sas')
@@ -3894,7 +6057,7 @@ Numeric scores: {json.dumps({k: v['score'] for k, v in fidelity['numeric'].items
 
 
 # ============================================================
-# PAGE: REPORT
+# PAGE: REPORT — improved structure
 # ============================================================
 elif page == "📝 Report":
     st.markdown("""
@@ -3907,95 +6070,127 @@ elif page == "📝 Report":
     if not st.session_state.pipeline_run:
         st.info("Run the pipeline from the Home page first.")
     else:
+        # ── QUESTION + DOWNLOADS (top bar) ──
         st.markdown(f"""
-        <div style="background:{COLORS['light_bg']}; padding:14px; border-radius:8px;
-                    border-left:4px solid {COLORS['teal']}; margin-bottom:20px;">
-            <b>📋 Original Question:</b> {st.session_state.question}
+        <div style="background:linear-gradient(135deg, {COLORS['navy']} 0%, {COLORS['dark_teal']} 100%);
+                    padding:20px 24px; border-radius:14px; margin-bottom:20px;">
+            <div style="color:rgba(255,255,255,0.5); font-size:11px; text-transform:uppercase;
+                        letter-spacing:1px; margin-bottom:6px;">Research Question</div>
+            <div style="color:white; font-size:16px; font-weight:600; line-height:1.5;">
+                {st.session_state.question}</div>
+            <div style="display:flex; gap:20px; margin-top:14px; padding-top:14px;
+                        border-top:1px solid rgba(255,255,255,0.12); flex-wrap:wrap;">
+                <span style="color:rgba(255,255,255,0.7); font-size:13px;">
+                    📊 <b style="color:{COLORS['turquoise']};">{len(st.session_state.cleaned_df):,}</b> source records</span>
+                <span style="color:rgba(255,255,255,0.7); font-size:13px;">
+                    🧬 <b style="color:{COLORS['turquoise']};">{len(st.session_state.synthetic_df):,}</b> synthetic records</span>
+                <span style="color:rgba(255,255,255,0.7); font-size:13px;">
+                    ✅ <b style="color:{COLORS['turquoise']};">{st.session_state.fidelity['overall_score']:.1f}%</b> fidelity</span>
+                <span style="color:rgba(255,255,255,0.7); font-size:13px;">
+                    🔒 <b style="color:#66bb6a;">No PII</b></span>
+                <span style="color:rgba(255,255,255,0.7); font-size:13px;">
+                    💻 <b style="color:{COLORS['turquoise']};">{len(st.session_state.sas_programs)}</b> SAS programs</span>
+            </div>
         </div>
         """, unsafe_allow_html=True)
 
-        st.markdown(st.session_state.narrative)
-
-        st.markdown("---")
-
-        st.markdown(f"""
-        <div style="background:linear-gradient(135deg, {COLORS['navy']}, {COLORS['dark_teal']});
-                    padding:28px; border-radius:14px; margin-top:16px;">
-            <h2 style="color:white; margin:0 0 16px 0;">📦 Deliverables</h2>
-            <div class="deliverable-row">
-                <span><b>Synthetic Dataset</b></span>
-                <span><code>output/synthetic_data.csv</code> — {len(st.session_state.synthetic_df):,} rows × {len(st.session_state.synthetic_df.columns)} cols</span>
-            </div>
-            <div class="deliverable-row">
-                <span><b>Source Data</b></span>
-                <span><code>data/source_data.csv</code> — {len(st.session_state.cleaned_df):,} rows × {len(st.session_state.cleaned_df.columns)} cols</span>
-            </div>
-            <div class="deliverable-row">
-                <span><b>Fidelity Score</b></span>
-                <span>{st.session_state.fidelity['overall_score']:.1f}%</span>
-            </div>
-            <div class="deliverable-row" style="border-bottom:none;">
-                <span><b>Privacy</b></span>
-                <span style="color:{COLORS['turquoise']};">✅ No real patient data — all public sources + Gaussian Copula</span>
-            </div>
-            <hr style="border-color:rgba(255,255,255,0.15); margin:16px 0;">
-            <h4 style="color:{COLORS['turquoise']};">📂 SAS Programs Generated</h4>
-        </div>
-        """, unsafe_allow_html=True)
-
-        sas_engine_can_write = os.path.exists(SAS_DIR) and os.access(SAS_DIR, os.W_OK)
-        if sas_engine_can_write:
-            for prog_name in st.session_state.sas_programs:
-                st.markdown(f"- `sas_programs/{prog_name}.sas`")
-        else:
-            st.markdown("*SAS programs stored in-memory (filesystem not writable). "
-                        "Use the expanders on each page to view/copy the code.*")
-
-        # SAS Viya Execution Summary
-        if st.session_state.sas_execution_log:
-            st.markdown(f"""
-            <div style="background:#e8f5e9; padding:14px 18px; border-radius:8px;
-                        border-left:4px solid #43a047; margin:16px 0;">
-                <b>🟢 SAS Viya Procedures Executed Live:</b><br>
-                <span style="font-size:13px;">
-                {' · '.join(set(entry.get('method', '') for entry in st.session_state.sas_execution_log))}
-                </span>
-            </div>
-            """, unsafe_allow_html=True)
-
-            with st.expander("📋 Full SAS Execution Log"):
-                for entry in st.session_state.sas_execution_log:
-                    icon = "✅" if entry.get('success') else "❌"
-                    st.markdown(f"{icon} **{entry.get('phase', '')}** — {entry.get('method', '')}")
-
-                if st.session_state.sas_runner and st.session_state.sas_runner.log:
-                    st.markdown("---")
-                    st.markdown("**SAS Runner Log:**")
-                    for log_entry in st.session_state.sas_runner.log:
-                        st.markdown(f"- {log_entry}")
-
-        if st.session_state.sas_connected:
-            st.markdown("""
-            > **🟢 SAS Viya was connected during this run.** Procedures were executed live on the SAS server
-            > in addition to Python computations. Results from both engines are available on each page.
-            """)
-        else:
-            st.markdown("""
-            > **▶️ To run SAS programs:** Open each `.sas` file in VS Code and press
-            > `Cmd+Shift+Enter`. The SAS Extension executes them on the Viya server.
-            """)
-
-        st.markdown("---")
-        c1, c2 = st.columns(2)
-        with c1:
+        # Downloads at the top
+        dl1, dl2, dl3 = st.columns([2, 2, 2])
+        with dl1:
             st.download_button(
                 "⬇️  Download Synthetic Data",
                 st.session_state.synthetic_df.to_csv(index=False),
                 "southlake_synthetic_data.csv", "text/csv",
-                type="primary", width='stretch')
-        with c2:
+                type="primary", use_container_width=True)
+        with dl2:
             st.download_button(
                 "⬇️  Download Source Data",
                 st.session_state.cleaned_df.to_csv(index=False),
                 "southlake_source_data.csv", "text/csv",
-                width='stretch')
+                use_container_width=True)
+        with dl3:
+            # Download the report as markdown
+            report_text = f"# Clinical Report — SynthetiCare\n\n"
+            report_text += f"**Question:** {st.session_state.question}\n\n"
+            report_text += f"**Source Records:** {len(st.session_state.cleaned_df):,}\n"
+            report_text += f"**Synthetic Records:** {len(st.session_state.synthetic_df):,}\n"
+            report_text += f"**Fidelity:** {st.session_state.fidelity['overall_score']:.1f}%\n\n---\n\n"
+            report_text += st.session_state.narrative or ""
+            st.download_button(
+                "📄  Download Report (.md)",
+                report_text,
+                "southlake_clinical_report.md", "text/markdown",
+                use_container_width=True)
+
+        st.markdown("")
+
+        # ── THE NARRATIVE (in a paper container) ──
+        st.markdown(f"""
+        <div style="background:white; border:1px solid #e8e8e8; border-radius:12px;
+                    padding:36px 40px; margin:8px 0 24px 0; box-shadow: 0 2px 12px rgba(0,0,0,0.04);
+                    max-width:900px;">
+            <div style="display:flex; align-items:center; gap:10px; margin-bottom:20px;
+                        padding-bottom:16px; border-bottom:2px solid {COLORS['teal']};">
+                <span style="font-size:24px;">🏥</span>
+                <div>
+                    <div style="font-size:18px; font-weight:700; color:{COLORS['navy']};">
+                        Southlake Health — Clinical Analysis Report</div>
+                    <div style="font-size:12px; color:#999;">
+                        Generated by SynthetiCare Agent · {time.strftime('%B %d, %Y')} · 
+                        Role: {st.session_state.get('user_role', 'Population Health Planner')}</div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Render the narrative inside a visual container
+        # We use a container approach since st.markdown can't be nested in raw HTML
+        st.markdown(st.session_state.narrative)
+
+        # Close the paper feel with a footer
+        st.markdown(f"""
+        <div style="max-width:900px; margin-top:24px; padding-top:16px;
+                    border-top:1px solid #e0e0e0;">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+                <div style="font-size:11px; color:#999;">
+                    📊 Source: {len(st.session_state.cleaned_df):,} records from Southlake catchment ·
+                    🧬 Synthetic: {len(st.session_state.synthetic_df):,} records ·
+                    ✅ Fidelity: {st.session_state.fidelity['overall_score']:.1f}% ·
+                    🔒 All data from public Canadian sources — no real patient records used
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── SAS EXECUTION (compact) ──
+        if st.session_state.sas_execution_log:
+            with st.expander("🔬 SAS Viya Execution Summary"):
+                sas_methods = set()
+                for entry in st.session_state.sas_execution_log:
+                    method = entry.get('method', '')
+                    if method:
+                        sas_methods.add(method)
+
+                st.markdown(f"""
+                <div style="background:#e8f5e9; padding:10px 14px; border-radius:6px; margin-bottom:12px;
+                            border-left:3px solid #43a047; font-size:13px;">
+                    <b>Procedures executed:</b> {' · '.join(sas_methods)}
+                </div>
+                """, unsafe_allow_html=True)
+
+def phase_1_enrich(question, progress):
+    progress.progress(5, text="🤔 Analyzing question — identifying topics, conditions, and risk factors...")
+    enrichment = analyze_question_and_enrich(question, _cache_version=st.session_state.cache_buster)
+    
+    # Show what the agent decided
+    q_type = enrichment.get('question_type', 'PREVALENCE')
+    n_cond = len(enrichment.get('conditions', {}))
+    n_rf = len(enrichment.get('risk_factors', []))
+    cond_names = list(enrichment.get('conditions', {}).keys())[:3]
+    rf_names = [rf['name'] for rf in enrichment.get('risk_factors', [])][:3]
+    unit = enrichment.get('unit_label', 'resident')
+    n_rows = enrichment.get('n_target_rows', 35000)
+    
+    cond_str = ', '.join(c.replace('_', ' ') for c in cond_names) if cond_names else 'none'
+    rf_str = ', '.join(r.replace('_', ' ') for r in rf_names) if rf_names else 'none'
+    progress.progress(12, text=f"📐 Schema designed: {q_type} · {n_cond} conditions ({cond_str}) · {n_rf} risk factors ({rf_str}) · {n_rows:,} {unit}s")

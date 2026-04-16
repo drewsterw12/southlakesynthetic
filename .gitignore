@@ -1,6 +1,8 @@
 env/
 __pycache__/
-*.pyc.DS_Store
+*.pyc
 data/
 output/
 charts/
+sas_programs/.DS_Store
+Untitled-1.ipynb
