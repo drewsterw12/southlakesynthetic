@@ -3719,6 +3719,7 @@ elif page == "📊 Profiling":
                     sas_numeric_cols = [c[:32].replace(' ', '_').replace('-', '_') for c in numeric_cols]
                     
                     sas_runner.upload_dataframe(sas_df, 'PROFILE_DATA')
+                    # Use the column names from the renamed dataframe, not the truncated original names
                     _, sas_means_result = sas_runner.run_proc_means(sas_df, variables=sas_numeric_cols[:20], table_name='PROFILE_DATA')
                     _, sas_univ_result = sas_runner.run_proc_univariate(sas_numeric_cols[:10], table_name='PROFILE_DATA')
                 except Exception as e:
@@ -6161,7 +6162,125 @@ elif page == "📝 Report":
             </div>
         </div>
         """, unsafe_allow_html=True)
+        # ── ASK ABOUT THIS ANALYSIS (Chatbot) ──
+        st.markdown("---")
+        st.markdown(f"""
+        <div style="margin-bottom:12px;">
+            <span style="font-size:13px; font-weight:700; color:{COLORS['navy']}; text-transform:uppercase;
+                        letter-spacing:1px;">💬 Ask About This Analysis</span>
+            <span style="font-size:12px; color:#999; margin-left:8px;">
+                Ask any question about the data, findings, methodology, or recommendations</span>
+        </div>
+        """, unsafe_allow_html=True)
 
+        # Initialize chat history
+        if 'chat_history' not in st.session_state:
+            st.session_state.chat_history = []
+
+        # Display chat history
+        for msg in st.session_state.chat_history:
+            if msg['role'] == 'user':
+                st.markdown(f"""
+                <div style="display:flex; justify-content:flex-end; margin-bottom:12px;">
+                    <div style="background:{COLORS['teal']}; color:white; padding:10px 16px; border-radius:12px 12px 2px 12px;
+                                max-width:70%; font-size:13px;">{msg['content']}</div>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div style="display:flex; justify-content:flex-start; margin-bottom:12px;">
+                    <div style="background:{COLORS['light_bg']}; color:{COLORS['navy']}; padding:10px 16px; 
+                                border-radius:12px 12px 12px 2px; max-width:70%; font-size:13px;
+                                border:1px solid {COLORS['teal']}20;">{msg['content']}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        # Chat input
+        chat_input = st.chat_input("Ask about the data, findings, or methodology...")
+
+        if chat_input:
+            # Add user message to history
+            st.session_state.chat_history.append({'role': 'user', 'content': chat_input})
+
+            try:
+                from langchain_openai import ChatOpenAI
+                from langchain_core.messages import HumanMessage, SystemMessage
+
+                api_key = os.getenv("OPENAI_API_KEY")
+                if not api_key:
+                    raise ValueError("No API key")
+
+                chat_llm = ChatOpenAI(model="gpt-4o", temperature=0.1, api_key=api_key, max_tokens=600)
+
+                # Build context from the current analysis
+                enrichment_chat = st.session_state.get('enrichment', {})
+                cleaned_chat = st.session_state.cleaned_df
+                synthetic_chat = st.session_state.synthetic_df
+                fidelity_chat = st.session_state.fidelity
+                narrative_chat = st.session_state.narrative or ""
+
+                # Get key stats for context
+                numeric_chat_cols = [c for c in cleaned_chat.columns if pd.api.types.is_numeric_dtype(cleaned_chat[c])]
+                stats_summary = cleaned_chat[numeric_chat_cols].describe().round(2).to_string() if numeric_chat_cols else "No numeric columns"
+
+                # Build chat history for LLM
+                chat_messages = [
+                    SystemMessage(content=f"""You are a helpful data analyst assistant for Southlake Health. 
+You have access to the FULL context of the current analysis. Answer questions accurately using this context.
+
+CURRENT ANALYSIS CONTEXT:
+- Question: {st.session_state.question}
+- Schema type: {enrichment_chat.get('question_type', 'Unknown')}
+- Schema description: {enrichment_chat.get('schema_description', '')}
+- Unit of observation: {enrichment_chat.get('unit_label', 'record')}
+- Source records: {len(cleaned_chat):,}
+- Synthetic records: {len(synthetic_chat):,}
+- Overall fidelity: {fidelity_chat['overall_score']:.1f}%
+- Correlation preservation: {fidelity_chat.get('correlation_score', 'N/A')}
+- Conditions in dataset: {list(enrichment_chat.get('conditions', {}).keys())}
+- Risk factors: {[rf['name'] for rf in enrichment_chat.get('risk_factors', [])]}
+- Variables: {list(cleaned_chat.columns)}
+- Modules enabled: Housing={enrichment_chat.get('include_housing', False)}, Falls={enrichment_chat.get('include_falls', False)}, ER={enrichment_chat.get('include_er_utilization', False)}
+
+KEY STATISTICS:
+{stats_summary}
+
+CLINICAL REPORT (already generated):
+{narrative_chat[:2000]}
+
+RULES:
+- Answer concisely — 2-4 sentences for simple questions, more for complex ones
+- Use actual numbers from the data when possible
+- If asked about methodology, explain the Gaussian Copula, schema design, or fidelity metrics
+- If asked about privacy, explain DCR and that no real patient data was used
+- If asked about a variable, give its mean, range, and any notable correlations
+- If asked something outside the scope of this analysis, say so honestly
+- Do NOT make up numbers — only use what's in the context above
+- Be conversational but professional""")
+                ]
+
+                # Add chat history
+                for msg in st.session_state.chat_history[-10:]:
+                    if msg['role'] == 'user':
+                        chat_messages.append(HumanMessage(content=msg['content']))
+
+                response = chat_llm.invoke(chat_messages)
+                assistant_msg = response.content
+
+                # Add assistant response to history
+                st.session_state.chat_history.append({'role': 'assistant', 'content': assistant_msg})
+                st.rerun()
+
+            except Exception as e:
+                error_msg = f"Sorry, I couldn't process that question. ({str(e)[:100]})"
+                st.session_state.chat_history.append({'role': 'assistant', 'content': error_msg})
+                st.rerun()
+
+        # Clear chat button
+        if st.session_state.chat_history:
+            if st.button("🗑️ Clear Chat", key="clear_chat"):
+                st.session_state.chat_history = []
+                st.rerun()
         # ── SAS EXECUTION (compact) ──
         if st.session_state.sas_execution_log:
             with st.expander("🔬 SAS Viya Execution Summary"):
@@ -6177,20 +6296,3 @@ elif page == "📝 Report":
                     <b>Procedures executed:</b> {' · '.join(sas_methods)}
                 </div>
                 """, unsafe_allow_html=True)
-
-def phase_1_enrich(question, progress):
-    progress.progress(5, text="🤔 Analyzing question — identifying topics, conditions, and risk factors...")
-    enrichment = analyze_question_and_enrich(question, _cache_version=st.session_state.cache_buster)
-    
-    # Show what the agent decided
-    q_type = enrichment.get('question_type', 'PREVALENCE')
-    n_cond = len(enrichment.get('conditions', {}))
-    n_rf = len(enrichment.get('risk_factors', []))
-    cond_names = list(enrichment.get('conditions', {}).keys())[:3]
-    rf_names = [rf['name'] for rf in enrichment.get('risk_factors', [])][:3]
-    unit = enrichment.get('unit_label', 'resident')
-    n_rows = enrichment.get('n_target_rows', 35000)
-    
-    cond_str = ', '.join(c.replace('_', ' ') for c in cond_names) if cond_names else 'none'
-    rf_str = ', '.join(r.replace('_', ' ') for r in rf_names) if rf_names else 'none'
-    progress.progress(12, text=f"📐 Schema designed: {q_type} · {n_cond} conditions ({cond_str}) · {n_rf} risk factors ({rf_str}) · {n_rows:,} {unit}s")
